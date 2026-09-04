@@ -24,6 +24,8 @@ from picamera2 import Picamera2
 from typing import Optional, Dict, Any
 
 np = None
+_NATURAL_PAIR_LUT_CACHE = {}
+_NATURAL_PAIR_LUT_CHUNK_SIZE = 4096
 
 def _lazy_import_numpy():
     """Import NumPy only when image processing/display conversion needs it."""
@@ -106,6 +108,14 @@ SATURATED_PALETTE = [
     [156, 72, 75],      # Muted Red
     [208, 190, 71],     # Muted Yellow
 ]
+
+GB_COLOR_PALETTE_COMBINATIONS = {
+    "blue_yellow": [0, 5, 2, 1],
+    "green_yellow": [0, 6, 2, 1],
+    "red_yellow": [0, 3, 2, 1],
+    "blue_red": [0, 5, 3, 1],
+    "blue_green": [0, 5, 6, 1],
+}
 
 def get_dashboard_access_info(hostname=None, ip_address=None):
     """Build the friendly dashboard URLs for this device."""
@@ -278,7 +288,9 @@ class CameraManager:
                     "color_factor": 1.4,
                     "dithering_method": "floyd_steinberg",
                     "bayer_size": 4,
-                    "threshold_scale": 1.0
+                    "threshold_scale": 1.0,
+                    "tone_map": "percentile",
+                    "gb_color_palette": "blue_yellow"
                 },
                 "display": {
                     "auto_display": True,
@@ -527,6 +539,351 @@ class ImageProcessor:
             return ImageProcessor.get_bayer_matrix(4)
 
     @staticmethod
+    def _palette_image(indices, palette):
+        """Build a palette image while keeping the physical index layout stable."""
+        Image, _ = _lazy_import_pil()
+        np = _lazy_import_numpy()
+        output_image = Image.fromarray(np.asarray(indices, dtype=np.uint8), mode='P')
+        palette_flat = np.asarray(palette, dtype=np.uint8).reshape(-1, 3).flatten().tolist()
+        palette_flat += [0, 0, 0] * (256 - len(palette_flat) // 3)
+        output_image.putpalette(palette_flat)
+        return output_image
+
+    @staticmethod
+    def _srgb_to_linear(rgb):
+        """Convert sRGB colors in [0, 255] to linear RGB."""
+        np = _lazy_import_numpy()
+        values = np.asarray(rgb, dtype=np.float32) / 255.0
+        return np.where(
+            values > 0.04045,
+            ((values + 0.055) / 1.055) ** 2.4,
+            values / 12.92,
+        )
+
+    @staticmethod
+    def _linear_to_srgb(rgb):
+        """Convert linear RGB values to sRGB colors in [0, 255]."""
+        np = _lazy_import_numpy()
+        values = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+        return np.where(
+            values > 0.0031308,
+            1.055 * (values ** (1.0 / 2.4)) - 0.055,
+            12.92 * values,
+        ) * 255.0
+
+    @staticmethod
+    def _rgb_to_lab(rgb):
+        """Convert RGB colors in [0, 255] to CIELAB."""
+        np = _lazy_import_numpy()
+        values = np.asarray(rgb, dtype=np.float32).reshape(-1, 3) / 255.0
+        linear = np.where(
+            values > 0.04045,
+            ((values + 0.055) / 1.055) ** 2.4,
+            values / 12.92,
+        )
+        matrix = np.array([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ], dtype=np.float32)
+        xyz = linear @ matrix.T
+        xyz[:, 0] /= 0.95047
+        xyz[:, 2] /= 1.08883
+        factors = np.where(
+            xyz > 0.008856,
+            np.cbrt(xyz),
+            (903.3 * xyz + 16.0) / 116.0,
+        )
+        lab = np.empty_like(xyz)
+        lab[:, 0] = 116.0 * factors[:, 1] - 16.0
+        lab[:, 1] = 500.0 * (factors[:, 0] - factors[:, 1])
+        lab[:, 2] = 200.0 * (factors[:, 1] - factors[:, 2])
+        return lab
+
+    @staticmethod
+    def _get_natural_pair_lut(physical_palette):
+        """Cache pair choices for the 32K RGB colors used by the image path."""
+        np = _lazy_import_numpy()
+        cache_key = physical_palette.astype(np.uint8, copy=False).tobytes()
+        cached = _NATURAL_PAIR_LUT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        physical_palette = physical_palette.astype(np.float32, copy=False)
+        physical_lab = ImageProcessor._rgb_to_lab(physical_palette)
+        physical_linear = ImageProcessor._srgb_to_linear(physical_palette)
+        fractions = np.arange(1, 16, dtype=np.float32) / 16.0
+        pair_first = []
+        pair_second = []
+        mixed_lab = []
+
+        for first in range(len(physical_palette)):
+            for second in range(first + 1, len(physical_palette)):
+                mixed_linear = (
+                    physical_linear[first][None, :] * (1.0 - fractions[:, None])
+                    + physical_linear[second][None, :] * fractions[:, None]
+                )
+                mixed_lab.append(
+                    ImageProcessor._rgb_to_lab(
+                        ImageProcessor._linear_to_srgb(mixed_linear)
+                    )
+                )
+                pair_first.extend([first] * len(fractions))
+                pair_second.extend([second] * len(fractions))
+
+        mixed_lab = np.asarray(mixed_lab, dtype=np.float32)
+        mixed_chroma = np.hypot(mixed_lab[:, :, 1], mixed_lab[:, :, 2])
+        pair_count = mixed_lab.shape[0]
+        candidate_lab = mixed_lab.reshape(-1, 3)
+
+        levels = np.arange(32, dtype=np.float32) * 8.0 + 4.0
+        red, green, blue = np.meshgrid(levels, levels, levels, indexing="ij")
+        cube_rgb = np.stack([red, green, blue], axis=-1).reshape(-1, 3)
+        cube_lab = ImageProcessor._rgb_to_lab(cube_rgb)
+        cube_chroma = np.hypot(cube_lab[:, 1], cube_lab[:, 2])
+        single_distances = np.sum(
+            (cube_lab[:, None, :] - physical_lab[None, :, :]) ** 2,
+            axis=2,
+        )
+        best_first = np.argmin(single_distances, axis=1).astype(np.uint8)
+        best_second = best_first.copy()
+        best_fraction = np.zeros(cube_lab.shape[0], dtype=np.uint8)
+        pair_first = np.asarray(pair_first, dtype=np.uint8).reshape(pair_count, 15)
+        pair_second = np.asarray(pair_second, dtype=np.uint8).reshape(pair_count, 15)
+
+        for start in range(0, cube_lab.shape[0], _NATURAL_PAIR_LUT_CHUNK_SIZE):
+            end = min(start + _NATURAL_PAIR_LUT_CHUNK_SIZE, cube_lab.shape[0])
+            raw_distances = np.sum(
+                (cube_lab[start:end, None, :] - candidate_lab[None, :, :]) ** 2,
+                axis=2,
+            ).reshape(end - start, pair_count, 15)
+            fraction_choice = np.argmin(raw_distances, axis=2)
+            pair_distance = np.take_along_axis(
+                raw_distances,
+                fraction_choice[:, :, None],
+                axis=2,
+            )[:, :, 0]
+            selected_chroma = mixed_chroma[
+                np.arange(pair_count)[None, :],
+                fraction_choice,
+            ]
+            pair_distance += np.abs(
+                selected_chroma - cube_chroma[start:end, None]
+            ) * 4.0
+
+            all_distances = np.concatenate(
+                (single_distances[start:end], pair_distance),
+                axis=1,
+            )
+            choice = np.argmin(all_distances, axis=1)
+            pair_choice = np.clip(
+                choice - len(physical_palette),
+                0,
+                pair_count - 1,
+            )
+            selected_fraction = fraction_choice[
+                np.arange(end - start), pair_choice
+            ]
+            best_first[start:end] = np.where(
+                choice < len(physical_palette),
+                choice,
+                pair_first[pair_choice, selected_fraction],
+            ).astype(np.uint8)
+            best_second[start:end] = np.where(
+                choice < len(physical_palette),
+                choice,
+                pair_second[pair_choice, selected_fraction],
+            ).astype(np.uint8)
+            best_fraction[start:end] = np.where(
+                choice < len(physical_palette),
+                0,
+                selected_fraction + 1,
+            ).astype(np.uint8)
+
+        result = best_first, best_second, best_fraction
+        _NATURAL_PAIR_LUT_CACHE[cache_key] = result
+        return result
+
+    @staticmethod
+    def _tone_map_luminance(image):
+        """Map the 2nd-98th luminance percentiles to the full display range."""
+        Image, _ = _lazy_import_pil()
+        np = _lazy_import_numpy()
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+        luminance = (
+            (0.299 * rgb[:, :, 0])
+            + (0.587 * rgb[:, :, 1])
+            + (0.114 * rgb[:, :, 2])
+        )
+        low, high = np.percentile(luminance, (2.0, 98.0))
+        if high - low <= 1.0:
+            return image.convert("RGB")
+        mapped_luminance = np.clip(
+            (luminance - low) / max(float(high - low), 1.0),
+            0.0,
+            1.0,
+        ) * 255.0
+        ratio = np.divide(
+            mapped_luminance,
+            luminance,
+            out=np.zeros_like(mapped_luminance),
+            where=luminance > 0.001,
+        )
+        mapped_rgb = np.clip(rgb * ratio[:, :, None], 0.0, 255.0)
+        return Image.fromarray(np.rint(mapped_rgb).astype(np.uint8), mode="RGB")
+
+    @staticmethod
+    def _blended_palette_array(saturation):
+        """Build the rounded palette used by the experimental physical-color modes."""
+        np = _lazy_import_numpy()
+        colors = []
+        for palette_index in [0, 1, 5, 4, 0, 3, 2]:
+            saturated = np.asarray(SATURATED_PALETTE[palette_index], dtype=np.float32)
+            desaturated = np.asarray(DESATURATED_PALETTE[palette_index], dtype=np.float32)
+            colors.append(np.rint(
+                saturated * saturation + desaturated * (1.0 - saturation)
+            ).clip(0, 255))
+        return np.asarray(colors, dtype=np.uint8)
+
+    @staticmethod
+    def apply_natural_pair_dithering(image, saturation=0.45, brightness_factor=1.05,
+                                     color_factor=1.15, bayer_size=4,
+                                     threshold_scale=1.0, tone_map="percentile"):
+        """Dither toward the best mixture of two physical display colors."""
+        np = _lazy_import_numpy()
+        Image, ImageEnhance = _lazy_import_pil()
+        enhanced = ImageEnhance.Brightness(image.convert("RGB")).enhance(brightness_factor)
+        enhanced = ImageEnhance.Color(enhanced).enhance(color_factor)
+        if tone_map == "percentile":
+            enhanced = ImageProcessor._tone_map_luminance(enhanced)
+
+        source_rgb = np.asarray(enhanced, dtype=np.float32)
+        height, width = source_rgb.shape[:2]
+        palette = ImageProcessor._blended_palette_array(saturation).astype(np.float32)
+        physical_indices = np.asarray([0, 1, 2, 3, 5, 6], dtype=np.int32)
+        physical_palette = palette[physical_indices]
+        first_lut, second_lut, fraction_lut = ImageProcessor._get_natural_pair_lut(
+            physical_palette
+        )
+        quantized = np.clip((source_rgb / 8.0).astype(np.int32), 0, 31)
+        lookup_keys = (
+            (quantized[:, :, 0] << 10)
+            | (quantized[:, :, 1] << 5)
+            | quantized[:, :, 2]
+        )
+        best_first = first_lut[lookup_keys].reshape(-1)
+        best_second = second_lut[lookup_keys].reshape(-1)
+        best_fraction = fraction_lut[lookup_keys].reshape(-1).astype(np.float32) / 16.0
+
+        bayer = np.tile(
+            ImageProcessor.get_bayer_matrix(bayer_size),
+            ((height + bayer_size - 1) // bayer_size,
+             (width + bayer_size - 1) // bayer_size),
+        )[:height, :width].reshape(-1)
+        threshold = np.clip(
+            0.5 + (bayer - 0.5) * threshold_scale,
+            0.0,
+            1.0,
+        )
+        selected = np.where(threshold < best_fraction, best_second, best_first)
+        indices = physical_indices[selected].reshape(height, width)
+        return ImageProcessor._palette_image(indices, palette)
+
+    @staticmethod
+    def apply_gb_default_dithering(image, brightness_factor=1.05,
+                                   threshold_scale=1.0, fake_colors=False,
+                                   gb_color_palette="blue_yellow"):
+        """Apply the gb-photo default tone curve with a panel-safe output palette."""
+        np = _lazy_import_numpy()
+        Image, ImageEnhance = _lazy_import_pil()
+        enhanced = ImageEnhance.Brightness(image.convert("RGB")).enhance(brightness_factor)
+        rgb = np.asarray(enhanced, dtype=np.float32) / 255.0
+        luminance = (
+            (0.299 * rgb[:, :, 0])
+            + (0.587 * rgb[:, :, 1])
+            + (0.114 * rgb[:, :, 2])
+        )
+        low, high = np.percentile(luminance, (2.0, 98.0))
+        if high - low > (1.0 / 255.0):
+            luminance = np.clip((luminance - low) / (high - low), 0.0, 1.0)
+
+        height, width = luminance.shape
+        pattern = np.tile(
+            ImageProcessor.get_bayer_matrix(4).T,
+            ((height + 3) // 4, (width + 3) // 4),
+        )[:height, :width]
+        pattern_values = np.clip(
+            np.rint(7.5 + (np.rint(pattern * 16.0) - 7.5) * threshold_scale),
+            0,
+            15,
+        ).astype(np.int32)
+        camera_range = np.asarray([0x8A, 0x92, 0xA1, 0xC8], dtype=np.float32)
+        camera_span = camera_range[-1] - camera_range[0]
+        starts = (camera_range[:-1] - camera_range[0]) / camera_span
+        steps = (camera_range[1:] - camera_range[:-1]) / (16.0 * camera_span)
+        thresholds = np.stack([
+            starts[index] + pattern_values * steps[index]
+            for index in range(3)
+        ], axis=-1)
+        first, second, third = thresholds[:, :, 0], thresholds[:, :, 1], thresholds[:, :, 2]
+        shades = np.where(
+            luminance <= first,
+            np.divide(
+                luminance,
+                first,
+                out=np.zeros_like(luminance),
+                where=first > 0.0,
+            ),
+            np.where(
+                luminance <= second,
+                1.0 + (luminance - first) / (second - first),
+                np.where(
+                    luminance <= third,
+                    2.0 + (luminance - second) / (third - second),
+                    3.0,
+                ),
+            ),
+        )
+        shades = np.clip(shades, 0.0, 3.0)
+        variation_pattern = (
+            np.random.default_rng(0).permutation(32 * 32).reshape(32, 32)
+            .astype(np.float32) / (32 * 32)
+        )
+        variation = np.tile(
+            variation_pattern,
+            ((height + 31) // 32, (width + 31) // 32),
+        )[:height, :width]
+        if fake_colors:
+            palette = ImageProcessor._blended_palette_array(0.45)
+            shade_indices = np.asarray(
+                GB_COLOR_PALETTE_COMBINATIONS.get(
+                    gb_color_palette,
+                    GB_COLOR_PALETTE_COMBINATIONS["blue_yellow"],
+                ),
+                dtype=np.uint8,
+            )
+            lower = np.floor(shades).astype(np.int32)
+            upper = np.minimum(lower + 1, 3)
+            fraction = shades - lower
+            indices = np.where(
+                variation < fraction,
+                shade_indices[upper],
+                shade_indices[lower],
+            )
+        else:
+            palette = np.asarray([
+                [0, 0, 0],
+                [255, 255, 255],
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ], dtype=np.uint8)
+            indices = (variation < (shades / 3.0)).astype(np.uint8)
+        return ImageProcessor._palette_image(indices, palette)
+
+    @staticmethod
     def apply_ordered_dithering(image, saturation=0.6, brightness_factor=1.1, color_factor=1.4,
                                bayer_size=4, threshold_scale=1.0):
         """Apply ordered dithering using standard Bayer threshold + LUT nearest-color."""
@@ -667,43 +1024,65 @@ class ImageProcessor:
 
     @staticmethod
     def apply_dithering(image, saturation=0.6, brightness_factor=1.1, color_factor=1.4,
-                       dithering_method="floyd_steinberg", bayer_size=4, threshold_scale=1.0):
+                       dithering_method="floyd_steinberg", bayer_size=4, threshold_scale=1.0,
+                       tone_map="percentile", gb_color_palette="blue_yellow"):
         """Applies brightness, color enhancement, and dithering."""
         if dithering_method == "ordered":
             return ImageProcessor.apply_ordered_dithering(
                 image, saturation, brightness_factor, color_factor, bayer_size, threshold_scale
             )
-        else:
-            Image, ImageEnhance = _lazy_import_pil()
+        if dithering_method == "bayer_natural_pair":
+            if tone_map not in {"none", "percentile"}:
+                raise ValueError(f"Unsupported tone map: {tone_map}")
+            return ImageProcessor.apply_natural_pair_dithering(
+                image, saturation, brightness_factor, color_factor,
+                bayer_size, threshold_scale, tone_map
+            )
+        if dithering_method == "gb-default":
+            return ImageProcessor.apply_gb_default_dithering(
+                image, brightness_factor, threshold_scale, fake_colors=False
+            )
+        if dithering_method == "gb-default-color":
+            if gb_color_palette not in GB_COLOR_PALETTE_COMBINATIONS:
+                raise ValueError(f"Unsupported Game Boy color palette: {gb_color_palette}")
+            return ImageProcessor.apply_gb_default_dithering(
+                image, brightness_factor, threshold_scale,
+                fake_colors=True, gb_color_palette=gb_color_palette
+            )
+        if dithering_method != "floyd_steinberg":
+            raise ValueError(f"Unsupported dithering method: {dithering_method}")
 
-            # Default Floyd-Steinberg dithering
-            # Ensure the image is in RGB mode
-            if image.mode != "RGB":
-                image = image.convert("RGB")
+        Image, ImageEnhance = _lazy_import_pil()
 
-            # Adjust brightness
-            enhancer = ImageEnhance.Brightness(image)
-            image = enhancer.enhance(brightness_factor)
+        # Default Floyd-Steinberg dithering
+        # Ensure the image is in RGB mode
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
-            # Adjust saturation
-            enhancer = ImageEnhance.Color(image)
-            image = enhancer.enhance(color_factor)
+        # Adjust brightness
+        enhancer = ImageEnhance.Brightness(image)
+        image = enhancer.enhance(brightness_factor)
 
-            # Blend the palette
-            palette = ImageProcessor.palette_blend(saturation)
+        # Adjust saturation
+        enhancer = ImageEnhance.Color(image)
+        image = enhancer.enhance(color_factor)
 
-            # Create a new palette image
-            palette_image = Image.new("P", (1, 1))
-            palette_image.putpalette(palette + [0, 0, 0] * (256 - len(palette) // 3))
+        # Blend the palette
+        palette = ImageProcessor.palette_blend(saturation)
 
-            # Convert the image using the custom palette and Floyd-Steinberg dithering
-            converted_image = image.quantize(palette=palette_image, dither=Image.FLOYDSTEINBERG)
+        # Create a new palette image
+        palette_image = Image.new("P", (1, 1))
+        palette_image.putpalette(palette + [0, 0, 0] * (256 - len(palette) // 3))
 
-            return converted_image
+        # Convert the image using the custom palette and Floyd-Steinberg dithering
+        converted_image = image.quantize(palette=palette_image, dither=Image.FLOYDSTEINBERG)
+
+        return converted_image
 
     @staticmethod
     def dither_to_display_buffer(image, saturation=0.6, brightness_factor=1.1, color_factor=1.4,
-                                  dithering_method="floyd_steinberg", bayer_size=4, threshold_scale=1.0):
+                                  dithering_method="floyd_steinberg", bayer_size=4, threshold_scale=1.0,
+                                  tone_map="percentile", gb_color_palette="blue_yellow"):
         """Dither an image and produce the packed display buffer in one step.
 
         Returns a tuple of (display_buffer, dithered_pil_image):
@@ -734,7 +1113,8 @@ class ImageProcessor:
         # Step 1: run the normal dithering to get the palette image
         dithered_image = ImageProcessor.apply_dithering(
             image, saturation, brightness_factor, color_factor,
-            dithering_method, bayer_size, threshold_scale
+            dithering_method, bayer_size, threshold_scale,
+            tone_map, gb_color_palette
         )
 
         dither_time = time.monotonic()
@@ -889,7 +1269,9 @@ class ImageProcessor:
                 color_factor=processing_settings.get("color_factor", 1.4),
                 dithering_method=processing_settings.get("dithering_method", "floyd_steinberg"),
                 bayer_size=processing_settings.get("bayer_size", 4),
-                threshold_scale=processing_settings.get("threshold_scale", 1.0)
+                threshold_scale=processing_settings.get("threshold_scale", 1.0),
+                tone_map=processing_settings.get("tone_map", "percentile"),
+                gb_color_palette=processing_settings.get("gb_color_palette", "blue_yellow")
             )
 
             # Save processed image as PNG (keep palette if present)
@@ -1163,7 +1545,8 @@ class EInkDisplay:
         self._display_thread = threading.Thread(target=_refresh, daemon=True)
         self._display_thread.start()
 
-    def display_photo_by_id(self, photo_id, file_manager, prefer_dithered=True):
+    def display_photo_by_id(self, photo_id, file_manager, prefer_dithered=True,
+                            processing_settings=None):
         """Display a photo by ID on the e-ink screen."""
         try:
             photo_info = file_manager.get_photo_info(photo_id)
@@ -1189,8 +1572,18 @@ class EInkDisplay:
             # If displaying original, we need to process it first
             if version == "original":
                 resized_image = ImageProcessor.resize_image(image)
-                # Use default processing settings for display
-                display_image = ImageProcessor.apply_dithering(resized_image)
+                settings = processing_settings or {}
+                display_image = ImageProcessor.apply_dithering(
+                    resized_image,
+                    saturation=settings.get("saturation", 0.6),
+                    brightness_factor=settings.get("brightness_factor", 1.1),
+                    color_factor=settings.get("color_factor", 1.4),
+                    dithering_method=settings.get("dithering_method", "floyd_steinberg"),
+                    bayer_size=settings.get("bayer_size", 4),
+                    threshold_scale=settings.get("threshold_scale", 1.0),
+                    tone_map=settings.get("tone_map", "percentile"),
+                    gb_color_palette=settings.get("gb_color_palette", "blue_yellow")
+                )
                 self.display_image(display_image)
             else:
                 # Dithered image can be displayed directly (just resize if needed)
@@ -1432,7 +1825,9 @@ class CameraSystem:
                     color_factor=processing_settings.get("color_factor", 1.4),
                     dithering_method=processing_settings.get("dithering_method", "floyd_steinberg"),
                     bayer_size=processing_settings.get("bayer_size", 4),
-                    threshold_scale=processing_settings.get("threshold_scale", 1.0)
+                    threshold_scale=processing_settings.get("threshold_scale", 1.0),
+                    tone_map=processing_settings.get("tone_map", "percentile"),
+                    gb_color_palette=processing_settings.get("gb_color_palette", "blue_yellow")
                 )
 
                 process_time = time.monotonic()
@@ -1473,7 +1868,11 @@ class CameraSystem:
 
     def display_photo_api(self, photo_id):
         """API-style photo display."""
-        return self.eink_display.display_photo_by_id(photo_id, self.file_manager)
+        return self.eink_display.display_photo_by_id(
+            photo_id,
+            self.file_manager,
+            processing_settings=self.camera_manager.settings.get("processing", {})
+        )
 
     def reprocess_photo_api(self, photo_id, processing_settings=None):
         """API-style photo reprocessing."""

@@ -107,11 +107,27 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     number(processing.get("saturation"), "processing.saturation", 0, 2)
     number(processing.get("brightness_factor"), "processing.brightness_factor", 0.1, 3)
     number(processing.get("color_factor"), "processing.color_factor", 0.1, 3)
-    if processing.get("dithering_method") not in {"floyd_steinberg", "ordered"}:
+    if processing.get("dithering_method") not in {
+        "floyd_steinberg",
+        "ordered",
+        "bayer_natural_pair",
+        "gb-default",
+        "gb-default-color",
+    }:
         raise SettingsValidationError("processing.dithering_method is unsupported")
     if processing.get("bayer_size") not in {2, 4, 8}:
         raise SettingsValidationError("processing.bayer_size must be 2, 4, or 8")
     number(processing.get("threshold_scale"), "processing.threshold_scale", 0.1, 2)
+    if processing.get("tone_map") not in {"none", "percentile"}:
+        raise SettingsValidationError("processing.tone_map is unsupported")
+    if processing.get("gb_color_palette") not in {
+        "blue_yellow",
+        "green_yellow",
+        "red_yellow",
+        "blue_red",
+        "blue_green",
+    }:
+        raise SettingsValidationError("processing.gb_color_palette is unsupported")
 
     display = section(settings, "display", "display")
     boolean(display.get("auto_display"), "display.auto_display")
@@ -151,7 +167,9 @@ class SettingsManager:
                 "color_factor": 1.4,
                 "dithering_method": "floyd_steinberg",
                 "bayer_size": 4,
-                "threshold_scale": 1.0
+                "threshold_scale": 1.0,
+                "tone_map": "percentile",
+                "gb_color_palette": "blue_yellow"
             },
             "display": {
                 "auto_display": True,
@@ -1594,9 +1612,12 @@ async def dashboard():
                             <select id="dithering-method" class="setting-input">
                                 <option value="floyd_steinberg">floyd steinberg</option>
                                 <option value="ordered">ordered (bayer)</option>
+                                <option value="bayer_natural_pair">bayer natural pair</option>
+                                <option value="gb-default">game boy default</option>
+                                <option value="gb-default-color">game boy default (color)</option>
                             </select>
                         </div>
-                        <div class="setting-help">Floyd–Steinberg is the default; ordered is still experimental</div>
+                        <div class="setting-help">Choose a physical-color or Game Boy Camera-inspired rendering style.</div>
                     </div>
                     <div class="setting-group" id="bayer-settings">
                         <div>
@@ -1612,6 +1633,27 @@ async def dashboard():
                         <div>
                             <span class="setting-label">threshold scale</span>
                             <input type="number" id="threshold-scale" class="setting-input" min="0.1" max="2.0" step="0.1">
+                        </div>
+                    </div>
+                    <div class="setting-group" id="tone-map-settings">
+                        <div>
+                            <span class="setting-label">natural pair tone map</span>
+                            <select id="tone-map" class="setting-input">
+                                <option value="percentile">percentile contrast</option>
+                                <option value="none">none</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-group" id="gb-color-settings">
+                        <div>
+                            <span class="setting-label">game boy color palette</span>
+                            <select id="gb-color-palette" class="setting-input">
+                                <option value="blue_yellow">black / blue / yellow / white</option>
+                                <option value="green_yellow">black / green / yellow / white</option>
+                                <option value="red_yellow">black / red / yellow / white</option>
+                                <option value="blue_red">black / blue / red / white</option>
+                                <option value="blue_green">black / blue / green / white</option>
+                            </select>
                         </div>
                     </div>
                 </div>
@@ -2280,6 +2322,8 @@ async def dashboard():
                 document.getElementById('dithering-method').value = settings.processing.dithering_method;
                 document.getElementById('bayer-size').value = settings.processing.bayer_size || 4;
                 document.getElementById('threshold-scale').value = settings.processing.threshold_scale || 1.0;
+                document.getElementById('tone-map').value = settings.processing.tone_map || 'percentile';
+                document.getElementById('gb-color-palette').value = settings.processing.gb_color_palette || 'blue_yellow';
                 
                 // Show/hide ordered dithering settings
                 toggleOrderedSettings();
@@ -2409,7 +2453,9 @@ async def dashboard():
                             color_factor: parseFloat(document.getElementById('color-factor').value),
                             dithering_method: document.getElementById('dithering-method').value,
                             bayer_size: parseInt(document.getElementById('bayer-size').value),
-                            threshold_scale: parseFloat(document.getElementById('threshold-scale').value)
+                            threshold_scale: parseFloat(document.getElementById('threshold-scale').value),
+                            tone_map: document.getElementById('tone-map').value,
+                            gb_color_palette: document.getElementById('gb-color-palette').value
                         },
                         system: {
                             camera_name: document.getElementById('camera-name').value.trim(),
@@ -2472,7 +2518,9 @@ async def dashboard():
                                 color_factor: 1.4,
                                 dithering_method: "floyd_steinberg",
                                 bayer_size: 4,
-                                threshold_scale: 1.0
+                                threshold_scale: 1.0,
+                                tone_map: "percentile",
+                                gb_color_palette: "blue_yellow"
                             },
                             system: {
                                 camera_name: "",
@@ -2544,14 +2592,21 @@ async def dashboard():
                 const ditheringMethod = document.getElementById('dithering-method').value;
                 const bayerSettings = document.getElementById('bayer-settings');
                 const thresholdSettings = document.getElementById('threshold-settings');
+                const toneMapSettings = document.getElementById('tone-map-settings');
+                const gbColorSettings = document.getElementById('gb-color-settings');
                 
-                if (ditheringMethod === 'ordered') {
+                if (['ordered', 'bayer_natural_pair'].includes(ditheringMethod)) {
                     bayerSettings.style.display = 'block';
-                    thresholdSettings.style.display = 'block';
                 } else {
                     bayerSettings.style.display = 'none';
+                }
+                if (['ordered', 'bayer_natural_pair', 'gb-default', 'gb-default-color'].includes(ditheringMethod)) {
+                    thresholdSettings.style.display = 'block';
+                } else {
                     thresholdSettings.style.display = 'none';
                 }
+                toneMapSettings.style.display = ditheringMethod === 'bayer_natural_pair' ? 'block' : 'none';
+                gbColorSettings.style.display = ditheringMethod === 'gb-default-color' ? 'block' : 'none';
             }
             
             function refreshGallery() {
