@@ -58,6 +58,7 @@ class RaspberryPi:
         # self.GPIO_CS_PIN     = gpiozero.LED(self.CS_PIN)
         self.GPIO_PWR_PIN    = gpiozero.LED(self.PWR_PIN)
         self.GPIO_BUSY_PIN   = gpiozero.Button(self.BUSY_PIN, pull_up = False)
+        self._module_initialized = False
 
         
 
@@ -115,6 +116,9 @@ class RaspberryPi:
 
     def module_init(self, cleanup=False):
         self.GPIO_PWR_PIN.on()
+
+        if self._module_initialized:
+            return 0
         
         if cleanup:
             find_dirs = [
@@ -143,9 +147,12 @@ class RaspberryPi:
             self.SPI.open(0, 0)
             self.SPI.max_speed_hz = 4000000
             self.SPI.mode = 0b00
+        self._module_initialized = True
         return 0
 
     def module_exit(self, cleanup=False):
+        if not self._module_initialized:
+            return
         logger.debug("spi end")
         self.SPI.close()
 
@@ -160,6 +167,8 @@ class RaspberryPi:
             # self.GPIO_CS_PIN.close()
             self.GPIO_PWR_PIN.close()
             self.GPIO_BUSY_PIN.close()
+
+        self._module_initialized = False
 
         
 

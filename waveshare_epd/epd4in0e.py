@@ -41,6 +41,9 @@ EPD_HEIGHT      = 600
 
 logger = logging.getLogger(__name__)
 
+class EPDRefreshAborted(RuntimeError):
+    """Raised when an active refresh is interrupted by a control action."""
+
 class EPD:
     def __init__(self):
         self.reset_pin = epdconfig.RST_PIN
@@ -85,17 +88,25 @@ class EPD:
         epdconfig.spi_writebyte2(data)
         epdconfig.digital_write(self.cs_pin, 1)
         
-    def ReadBusyH(self):
+    def _raise_if_aborted(self, abort_event):
+        if abort_event is not None and abort_event.is_set():
+            raise EPDRefreshAborted("E-paper refresh was interrupted")
+
+    def ReadBusyH(self, abort_event=None):
         logger.debug("e-Paper busy H")
         while(epdconfig.digital_read(self.busy_pin) == 0):      # 0: busy, 1: idle
+            self._raise_if_aborted(abort_event)
             epdconfig.delay_ms(5)
+        self._raise_if_aborted(abort_event)
         epdconfig.delay_ms(200)
         logger.debug("e-Paper busy H release")
 
-    def TurnOnDisplay(self):
+    def TurnOnDisplay(self, abort_event=None):
+        self._raise_if_aborted(abort_event)
         self.send_command(0x04) # POWER_ON
-        self.ReadBusyH()
+        self.ReadBusyH(abort_event)
 
+        self._raise_if_aborted(abort_event)
         self.send_command(0x06)
         self.send_data(0x6F)
         self.send_data(0x1F)
@@ -103,20 +114,23 @@ class EPD:
         self.send_data(0x27)
         epdconfig.delay_ms(200)
 
+        self._raise_if_aborted(abort_event)
         self.send_command(0x12) # DISPLAY_REFRESH
         self.send_data(0X00)
-        self.ReadBusyH()
+        self.ReadBusyH(abort_event)
         
+        self._raise_if_aborted(abort_event)
         self.send_command(0x02) # POWER_OFF
         self.send_data(0X00)
-        self.ReadBusyH()
+        self.ReadBusyH(abort_event)
         
-    def init(self):
+    def init(self, abort_event=None):
         if (epdconfig.module_init() != 0):
             return -1
         # EPD hardware init start
+        self._raise_if_aborted(abort_event)
         self.reset()
-        self.ReadBusyH()
+        self.ReadBusyH(abort_event)
         epdconfig.delay_ms(30)
 
         self.send_command(0xAA)   
@@ -179,7 +193,7 @@ class EPD:
 
         self.send_command(0x84)
         self.send_data(0x01)
-        self.ReadBusyH()
+        self.ReadBusyH(abort_event)
         return 0
 
     def getbuffer(self, image):
@@ -210,11 +224,12 @@ class EPD:
             
         return buf
 
-    def display(self, image):
+    def display(self, image, abort_event=None):
+        self._raise_if_aborted(abort_event)
         self.send_command(0x10)
         self.send_data2(image)
 
-        self.TurnOnDisplay()
+        self.TurnOnDisplay(abort_event)
         
     def Clear(self, color=0x11):
         self.send_command(0x10)
@@ -227,6 +242,15 @@ class EPD:
         self.send_data(0XA5)
         
         epdconfig.delay_ms(2000)
+        epdconfig.module_exit()
+
+    def force_stop(self):
+        """Remove panel power without waiting for BUSY to release."""
+        epdconfig.digital_write(self.reset_pin, 0)
+        epdconfig.digital_write(epdconfig.PWR_PIN, 0)
+
+    def shutdown(self):
+        """Release the GPIO and SPI resources after a forced stop."""
         epdconfig.module_exit()
 ### END OF FILE ###
 

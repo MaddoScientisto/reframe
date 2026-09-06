@@ -132,6 +132,9 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     display = section(settings, "display", "display")
     boolean(display.get("auto_display"), "display.auto_display")
     number(display.get("display_timeout"), "display.display_timeout", 0, 3600)
+    boolean(display.get("interrupt_refresh_on_capture"), "display.interrupt_refresh_on_capture")
+    if display.get("refresh_interrupt_action") not in {"reset", "stop"}:
+        raise SettingsValidationError("display.refresh_interrupt_action must be reset or stop")
 
     system = section(settings, "system", "system")
     integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
@@ -173,7 +176,9 @@ class SettingsManager:
             },
             "display": {
                 "auto_display": True,
-                "display_timeout": 0
+                "display_timeout": 0,
+                "interrupt_refresh_on_capture": False,
+                "refresh_interrupt_action": "reset"
             },
             "system": {
                 "auto_refresh_interval": 30,
@@ -1703,6 +1708,31 @@ async def dashboard():
                     <div class="setting-group">
                         <button class="button" onclick="showDashboardQr()" type="button">show dashboard QR</button>
                     </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">interrupt refresh on capture</span>
+                            <select id="interrupt-refresh-on-capture" class="setting-input">
+                                <option value="false">disabled</option>
+                                <option value="true">enabled</option>
+                            </select>
+                        </div>
+                        <div class="setting-help">Experimental: interrupt the current e-paper refresh when a new capture is requested.</div>
+                    </div>
+                    <div class="setting-group">
+                        <div>
+                            <span class="setting-label">capture interrupt action</span>
+                            <select id="refresh-interrupt-action" class="setting-input">
+                                <option value="reset">force reset</option>
+                                <option value="stop">force stop</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-group">
+                        <button class="button" onclick="forceResetDisplay()" type="button">force reset display</button>
+                        <button class="button danger-btn" onclick="forceStopDisplay()" type="button">force stop display</button>
+                        <button class="button" onclick="redrawCurrentImage()" type="button">redraw current image</button>
+                        <div class="setting-help" id="display-control-status">Manual display controls are experimental.</div>
+                    </div>
 
                 </div>
 
@@ -1863,6 +1893,39 @@ async def dashboard():
                     const btn = document.querySelector('button[onclick="clearScreen()"]');
                     if (btn) btn.disabled = false;
                 }
+            }
+
+            async function runDisplayControl(path, label) {
+                const status = document.getElementById('display-control-status');
+                status.textContent = `${label} in progress...`;
+                try {
+                    notifyUserActivity();
+                    const response = await fetch(path, { method: 'POST' });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok || data.success === false) {
+                        throw new Error(data.detail || data.message || `${label} failed`);
+                    }
+                    status.textContent = data.message || `${label} complete`;
+                    alert(data.message || `${label} complete`);
+                } catch (error) {
+                    console.error(`Error during ${label}:`, error);
+                    status.textContent = `${label} failed`;
+                    alert(error.message || `${label} failed`);
+                }
+            }
+
+            function forceResetDisplay() {
+                runDisplayControl('/api/display/force-reset', 'force reset');
+            }
+
+            function forceStopDisplay() {
+                if (confirm('Force-stop the panel and power it off?')) {
+                    runDisplayControl('/api/display/force-stop', 'force stop');
+                }
+            }
+
+            function redrawCurrentImage() {
+                runDisplayControl('/api/display/redraw', 'redraw');
             }
 
             function renderGallery() {
@@ -2334,6 +2397,9 @@ async def dashboard():
                 document.getElementById('auto-timeout-enabled').value = settings.system.auto_timeout_enabled ? 'true' : 'false';
                 document.getElementById('auto-timeout-minutes').value = settings.system.auto_timeout_minutes || 10;
                 document.getElementById('show-dashboard-qr-on-wifi-connect').value = settings.system.show_dashboard_qr_on_wifi_connect !== false ? 'true' : 'false';
+                const displaySettings = settings.display || {};
+                document.getElementById('interrupt-refresh-on-capture').value = displaySettings.interrupt_refresh_on_capture ? 'true' : 'false';
+                document.getElementById('refresh-interrupt-action').value = displaySettings.refresh_interrupt_action || 'reset';
                 const exportSettings = settings.exports || {};
                 document.getElementById('upscale-dithered-2x').value = exportSettings.upscale_dithered_2x ? 'true' : 'false';
                 document.getElementById('update-status').textContent = 'Updates code, dependencies, and service files while preserving settings and photos.';
@@ -2464,6 +2530,10 @@ async def dashboard():
                             auto_timeout_minutes: parseInt(document.getElementById('auto-timeout-minutes').value),
                             show_dashboard_qr_on_wifi_connect: document.getElementById('show-dashboard-qr-on-wifi-connect').value === 'true'
                         },
+                        display: {
+                            interrupt_refresh_on_capture: document.getElementById('interrupt-refresh-on-capture').value === 'true',
+                            refresh_interrupt_action: document.getElementById('refresh-interrupt-action').value
+                        },
                         exports: {
                             upscale_dithered_2x: document.getElementById('upscale-dithered-2x').value === 'true'
                         },
@@ -2528,6 +2598,12 @@ async def dashboard():
                                 auto_timeout_enabled: true,
                                 auto_timeout_minutes: 10,
                                 show_dashboard_qr_on_wifi_connect: true
+                            },
+                            display: {
+                                auto_display: true,
+                                display_timeout: 0,
+                                interrupt_refresh_on_capture: false,
+                                refresh_interrupt_action: "reset"
                             },
                             exports: {
                                 upscale_dithered_2x: false
@@ -3394,6 +3470,30 @@ async def clear_display():
         return resp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear display: {str(e)}")
+
+@app.post("/api/display/force-reset")
+async def force_reset_display():
+    """Proxy to force the e-ink panel reset line."""
+    try:
+        return await reframe_client.post("/display/force-reset")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reset display: {str(e)}")
+
+@app.post("/api/display/force-stop")
+async def force_stop_display():
+    """Proxy to force the e-ink panel power off."""
+    try:
+        return await reframe_client.post("/display/force-stop")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to stop display: {str(e)}")
+
+@app.post("/api/display/redraw")
+async def redraw_display():
+    """Proxy to redraw the last buffer sent to the e-ink panel."""
+    try:
+        return await reframe_client.post("/display/redraw")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to redraw display: {str(e)}")
 
 @app.post("/api/display/{photo_id}")
 async def display_photo_on_screen(photo_id: str):

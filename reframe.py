@@ -294,7 +294,9 @@ class CameraManager:
                 },
                 "display": {
                     "auto_display": True,
-                    "display_timeout": 0
+                    "display_timeout": 0,
+                    "interrupt_refresh_on_capture": False,
+                    "refresh_interrupt_action": "reset"
                 },
                 "system": {
                     "auto_refresh_interval": 30,
@@ -1464,6 +1466,9 @@ class EInkDisplay:
         self._display_busy = False  # True while the panel is mid-refresh
         self._display_thread = None
         self._display_lock = threading.Lock()
+        self._display_abort_event = None
+        self._last_display_buffer = None
+        self._needs_reinit = False
         self._init_lock = threading.Lock()
         self._init_thread = None
         logging.info("E-ink display: Lazy initialization enabled")
@@ -1471,19 +1476,21 @@ class EInkDisplay:
     def _ensure_initialized(self):
         """Initialize e-ink display only when first needed."""
         with self._init_lock:
-            if self._initialized:
+            if self._initialized and not self._needs_reinit:
                 return
             logging.info("Initializing e-ink display hardware...")
             import time
             from waveshare_epd import epd4in0e
             start_time = time.monotonic()
 
-            self.epd = epd4in0e.EPD()
+            if self.epd is None:
+                self.epd = epd4in0e.EPD()
             self.epd.init()
 
             init_time = time.monotonic() - start_time
             logging.info(f"E-ink display ready in {init_time:.2f}s")
             self._initialized = True
+            self._needs_reinit = False
 
     def prepare_async(self):
         """Start e-ink hardware initialization in the background."""
@@ -1496,19 +1503,26 @@ class EInkDisplay:
 
     def is_busy(self):
         """Check if the display is currently in the middle of a refresh cycle."""
-        return self._display_busy
+        with self._display_lock:
+            return self._display_busy
+
+    def _remember_display_buffer(self, buffer):
+        with self._display_lock:
+            self._last_display_buffer = bytearray(buffer)
 
     def display_image(self, image):
         """Displays the provided image on the e-ink display."""
         self._ensure_initialized()  # Initialize only when first used
         buffer = ImageProcessor.img2buffer(image)
         if buffer:
+            self._remember_display_buffer(buffer)
             self.epd.display(buffer)
 
     def display_buffer(self, buffer):
         """Send a pre-built display buffer to the e-ink panel (blocking)."""
         self._ensure_initialized()
         if buffer:
+            self._remember_display_buffer(buffer)
             self.epd.display(buffer)
 
     def display_buffer_async(self, buffer):
@@ -1519,13 +1533,17 @@ class EInkDisplay:
         new capture to avoid invisible captures with no feedback.
         """
         if not buffer:
-            return
+            return {"success": False, "message": "Display buffer is empty"}
 
+        buffer = bytearray(buffer)
         with self._display_lock:
             # If a previous refresh is somehow still running, log a warning
             if self._display_busy:
                 logging.warning("display_buffer_async: previous refresh still in progress, skipping")
-                return
+                return {"success": False, "error": "display_busy", "message": "Display is already refreshing"}
+            self._last_display_buffer = bytearray(buffer)
+            abort_event = threading.Event()
+            self._display_abort_event = abort_event
             self._display_busy = True
 
         def _refresh():
@@ -1533,17 +1551,98 @@ class EInkDisplay:
                 self._ensure_initialized()
                 logging.info("Display refresh started (background)")
                 refresh_start = time.monotonic()
-                self.epd.display(buffer)
+                self.epd.display(buffer, abort_event=abort_event)
                 refresh_time = time.monotonic() - refresh_start
                 logging.info(f"Display refresh completed in {refresh_time:.1f}s")
             except Exception as e:
-                logging.error(f"Display refresh error: {e}")
+                if abort_event.is_set():
+                    logging.info("Display refresh interrupted")
+                else:
+                    logging.error(f"Display refresh error: {e}")
             finally:
                 with self._display_lock:
-                    self._display_busy = False
+                    if self._display_abort_event is abort_event:
+                        self._display_abort_event = None
+                        self._display_busy = False
 
         self._display_thread = threading.Thread(target=_refresh, daemon=True)
         self._display_thread.start()
+        return {"success": True, "message": "Display refresh started"}
+
+    def _cancel_refresh(self):
+        with self._display_lock:
+            abort_event = self._display_abort_event
+            display_thread = self._display_thread
+            epd = self.epd
+            if abort_event is not None:
+                abort_event.set()
+        return epd, display_thread
+
+    def _wait_for_refresh_to_stop(self, display_thread):
+        if display_thread and display_thread is not threading.current_thread():
+            display_thread.join(timeout=5)
+        return not display_thread or not display_thread.is_alive()
+
+    def force_reset(self):
+        """Force the panel reset line and mark the controller for reinitialization."""
+        self._ensure_initialized()
+        epd, display_thread = self._cancel_refresh()
+        try:
+            epd.reset()
+        except Exception as e:
+            logging.error(f"Error forcing e-ink display reset: {e}")
+            return {"success": False, "error": str(e), "message": "Display reset failed"}
+
+        if not self._wait_for_refresh_to_stop(display_thread):
+            return {"success": False, "error": "display_busy", "message": "Display refresh did not stop after reset"}
+
+        with self._display_lock:
+            self._needs_reinit = True
+        logging.warning("E-ink display forcibly reset; next draw will reinitialize it")
+        return {"success": True, "message": "Display reset; next redraw will reinitialize the panel"}
+
+    def force_stop(self):
+        """Force panel power off and release its GPIO/SPI resources."""
+        self._ensure_initialized()
+        epd, display_thread = self._cancel_refresh()
+        try:
+            epd.force_stop()
+        except Exception as e:
+            logging.error(f"Error forcing e-ink display stop: {e}")
+            return {"success": False, "error": str(e), "message": "Display stop failed"}
+
+        if not self._wait_for_refresh_to_stop(display_thread):
+            return {"success": False, "error": "display_busy", "message": "Display refresh did not stop"}
+
+        try:
+            epd.shutdown()
+        except Exception as e:
+            logging.error(f"Error releasing e-ink display resources: {e}")
+            return {"success": False, "error": str(e), "message": "Display stopped but resource cleanup failed"}
+
+        with self._display_lock:
+            self.epd = None
+            self._initialized = False
+            self._needs_reinit = False
+        logging.warning("E-ink display forcibly stopped and powered off")
+        return {"success": True, "message": "Display force-stopped and powered off"}
+
+    def interrupt_refresh(self, action):
+        if action == "reset":
+            return self.force_reset()
+        if action == "stop":
+            return self.force_stop()
+        return {"success": False, "error": "invalid_action", "message": f"Unsupported refresh interrupt action: {action}"}
+
+    def redraw_last_display(self):
+        with self._display_lock:
+            buffer = bytearray(self._last_display_buffer) if self._last_display_buffer else None
+        if not buffer:
+            return {"success": False, "error": "no_display_image", "message": "No display image is available to redraw"}
+        result = self.display_buffer_async(buffer)
+        if result.get("success"):
+            result["message"] = "Redraw started for the current display image"
+        return result
 
     def display_photo_by_id(self, photo_id, file_manager, prefer_dithered=True,
                             processing_settings=None):
@@ -1835,8 +1934,19 @@ class CameraSystem:
 
                 # Send to display ASAP (async — screen starts blinking immediately)
                 if display_settings.get("auto_display", True):
+                    if (
+                        display_settings.get("interrupt_refresh_on_capture", False)
+                        and self.eink_display.is_busy()
+                    ):
+                        interrupt_action = display_settings.get("refresh_interrupt_action", "reset")
+                        interrupt_result = self.eink_display.interrupt_refresh(interrupt_action)
+                        if not interrupt_result.get("success"):
+                            logging.error("Could not interrupt display refresh: %s", interrupt_result.get("message"))
                     logging.info("Sending to display (async)")
-                    self.eink_display.display_buffer_async(display_buffer)
+                    display_result = self.eink_display.display_buffer_async(display_buffer)
+                    if not display_result.get("success"):
+                        logging.warning("Could not send photo to display: %s", display_result.get("message"))
+                        result["display_error"] = display_result.get("message")
 
                 display_sent_time = time.monotonic()
                 logging.info(f"Total button-to-display: {((display_sent_time - pipeline_start)*1000):.0f}ms")
@@ -1960,12 +2070,51 @@ def _create_fastapi_routes():
         global camera_system
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
-        if camera_system.eink_display.is_busy():
+        display_settings = camera_system.camera_manager.settings.get("display", {})
+        if (
+            camera_system.eink_display.is_busy()
+            and not display_settings.get("interrupt_refresh_on_capture", False)
+        ):
             return {"success": False, "error": "display_busy", "message": "Display is refreshing, please wait"}
         with _operation_lock:
             camera_system.update_activity()
             result = camera_system.capture_photo_api()
         return result
+
+    @app.post("/api/display/clear")
+    def api_clear_display():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        with _operation_lock:
+            return camera_system.eink_display.clear_display()
+
+    @app.post("/api/display/force-reset")
+    def api_force_reset_display():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        with _operation_lock:
+            camera_system.update_activity()
+            return camera_system.eink_display.force_reset()
+
+    @app.post("/api/display/force-stop")
+    def api_force_stop_display():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        with _operation_lock:
+            camera_system.update_activity()
+            return camera_system.eink_display.force_stop()
+
+    @app.post("/api/display/redraw")
+    def api_redraw_display():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        with _operation_lock:
+            camera_system.update_activity()
+            return camera_system.eink_display.redraw_last_display()
 
     @app.post("/api/display/{photo_id}")
     def api_display(photo_id: str):
@@ -2118,14 +2267,6 @@ def _create_fastapi_routes():
             "last_activity": time.time() - camera_system.camera_manager.get_inactivity_seconds()
         }
 
-    @app.post("/api/display/clear")
-    def api_clear_display():
-        global camera_system
-        if camera_system is None:
-            raise HTTPException(status_code=503, detail="Camera system not initialized")
-        with _operation_lock:
-            return camera_system.eink_display.clear_display()
-
     return app
 
 
@@ -2236,7 +2377,11 @@ def main():
                     if press_duration < LONG_PRESS_THRESHOLD:
                         # Block captures while display is mid-refresh to avoid
                         # invisible captures with no visual feedback
-                        if camera_system.eink_display.is_busy():
+                        display_settings = camera_system.camera_manager.settings.get("display", {})
+                        if (
+                            camera_system.eink_display.is_busy()
+                            and not display_settings.get("interrupt_refresh_on_capture", False)
+                        ):
                             logging.info(f"Short press detected ({press_duration:.1f}s) - display busy, ignoring")
                         else:
                             logging.info(f"Short press detected ({press_duration:.1f}s) - capturing photo...")
