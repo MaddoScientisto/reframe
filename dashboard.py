@@ -10,6 +10,7 @@ import shutil
 import math
 import tempfile
 import threading
+import base64
 from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1156,6 +1157,43 @@ async def dashboard():
                 overflow: hidden;
                 overscroll-behavior: contain;
             }
+
+            body.preview-open { overflow: hidden; }
+            .photo-preview {
+                margin: auto;
+                width: min(1100px, calc(100vw - 32px));
+                max-height: calc(100dvh - 32px);
+                padding: 20px;
+                border: 1px solid var(--panel-border-color);
+                background: var(--tertiary-color);
+                color: var(--secondary-color);
+                overflow-y: auto;
+                overscroll-behavior: contain;
+            }
+            .photo-preview::backdrop { background: rgba(0, 0, 0, 0.8); }
+            .preview-header { display: flex; align-items: center; gap: 16px; }
+            .preview-header h2 { font-size: 1rem; font-weight: normal; overflow-wrap: anywhere; flex: 1; }
+            .preview-close, .preview-rotate { width: 40px; height: 40px; flex: 0 0 40px; font-size: 24px; cursor: pointer; justify-content: center; }
+            .preview-rotation { display: flex; gap: 8px; margin-top: 12px; }
+            .preview-tabs { display: flex; border-bottom: 1px dotted var(--panel-border-color); margin: 12px 0; }
+            .preview-tabs button { font: inherit; padding: 10px 16px; border: 0; background: transparent; cursor: pointer; }
+            .preview-tabs [aria-selected="true"] { box-shadow: inset 0 -2px var(--secondary-color); }
+            .preview-stage { height: min(58dvh, 650px); display: flex; align-items: center; justify-content: center; background: #e0dedc; container-type: size; overflow: hidden; }
+            .preview-stage img { width: 100%; height: 100%; object-fit: contain; image-rendering: auto; }
+            .preview-stage img.quarter-turn { width: 100cqh; height: 100cqw; flex-shrink: 0; }
+            .preview-stage img.dithered { image-rendering: pixelated; }
+            .preview-controls { display: flex; flex-wrap: wrap; gap: 12px 20px; padding: 16px 0 0; }
+            .preview-controls[hidden], .preview-controls label[hidden] { display: none; }
+            .preview-controls label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+            .preview-controls select { max-width: 100%; font: inherit; padding: 8px; }
+            .preview-status { min-height: 2.5em; padding: 10px 0; overflow-wrap: anywhere; }
+            .photo-preview .photo-actions { justify-content: flex-start; }
+            .photo-preview .action-btn { border-color: var(--panel-border-color); }
+            .photo-preview [aria-disabled="true"], .photo-preview button:disabled { opacity: 0.45; pointer-events: none; }
+            @media (max-width: 600px) {
+                .photo-preview { padding: 12px; width: calc(100vw - 16px); max-height: calc(100dvh - 16px); }
+                .preview-stage { height: 42dvh; }
+            }
             
             .settings-content {
                 background-color: var(--tertiary-color);
@@ -1538,6 +1576,47 @@ async def dashboard():
             </div>
         </div>
         
+        <dialog id="photo-preview" class="photo-preview" aria-labelledby="preview-title">
+            <div class="preview-header">
+                <h2 id="preview-title">photo preview</h2>
+                <button type="button" class="preview-close action-btn" aria-label="Close preview" title="Close preview" onclick="closePhotoPreview()">&times;</button>
+            </div>
+            <div class="preview-tabs" role="tablist" aria-label="Photo version">
+                <button id="preview-original-tab" type="button" role="tab" aria-controls="preview-panel" aria-selected="false" tabindex="-1" onclick="setPreviewTab('original')">original</button>
+                <button id="preview-dithered-tab" type="button" role="tab" aria-controls="preview-panel" aria-selected="true" onclick="setPreviewTab('dithered')">dithered</button>
+            </div>
+            <div id="preview-panel" role="tabpanel" aria-labelledby="preview-dithered-tab">
+                <div class="preview-stage"><img id="preview-image" alt="" hidden></div>
+                <div class="preview-rotation" role="group" aria-label="Rotate preview and downloads">
+                    <button type="button" class="preview-rotate action-btn" aria-label="Rotate left" title="Rotate left" onclick="rotatePhotoPreview(-1)">&#8630;</button>
+                    <button type="button" class="preview-rotate action-btn" aria-label="Rotate right" title="Rotate right" onclick="rotatePhotoPreview(1)">&#8631;</button>
+                </div>
+                <div id="preview-controls" class="preview-controls">
+                    <label for="preview-mode">dither mode
+                        <select id="preview-mode" onchange="generatePhotoPreview()">
+                            <option value="saved">saved version</option>
+                            <option value="floyd_steinberg">floyd steinberg</option>
+                            <option value="ordered">ordered (bayer)</option>
+                            <option value="bayer_natural_pair">bayer natural pair</option>
+                            <option value="gb-default">game boy default</option>
+                            <option value="gb-default-color">game boy default (color)</option>
+                        </select>
+                    </label>
+                    <label id="preview-palette-label" for="preview-palette" hidden>color palette
+                        <select id="preview-palette" onchange="generatePhotoPreview()">
+                            <option value="blue_yellow">black / blue / yellow / white</option>
+                            <option value="green_yellow">black / green / yellow / white</option>
+                            <option value="red_yellow">black / red / yellow / white</option>
+                            <option value="blue_red">black / blue / red / white</option>
+                            <option value="blue_green">black / blue / green / white</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div id="preview-status" class="preview-status" role="status" aria-live="polite"></div>
+            <div id="preview-actions" class="photo-actions"></div>
+        </dialog>
+
         <!-- Settings Modal -->
         <div id="settings-modal" class="settings-modal">
             <div class="settings-content">
@@ -2107,52 +2186,18 @@ async def dashboard():
 
             function setupPhotoCardHandlers() {
                 const photoCards = document.querySelectorAll('.photo-card');
-                
                 photoCards.forEach(card => {
-                    let tapTimeout;
-                    let lastTap = 0;
-                    
-                    // Handle click/tap events
-                    card.addEventListener('click', function(e) {
-                        const currentTime = new Date().getTime();
-                        const tapLength = currentTime - lastTap;
-                        
-                        // Check if this is a touch device
-                        const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-                        
-                        if (isTouchDevice) {
-                            // On mobile: first tap shows buttons, second tap (double-tap) opens photo
-                            if (tapLength < 500 && tapLength > 0) {
-                                // Double tap - open photo
-                                const photoId = card.getAttribute('data-photo-id');
-                                viewPhoto(photoId);
-                                card.classList.remove('active');
-                            } else {
-                                // Single tap - toggle buttons
-                                clearTimeout(tapTimeout);
-                                tapTimeout = setTimeout(() => {
-                                    // Remove active class from all other cards
-                                    photoCards.forEach(otherCard => {
-                                        if (otherCard !== card) {
-                                            otherCard.classList.remove('active');
-                                        }
-                                    });
-                                    // Toggle this card
-                                    card.classList.toggle('active');
-                                }, 300);
-                            }
-                            lastTap = currentTime;
-                        } else {
-                            // On desktop: single click opens photo (hover shows buttons)
-                            const photoId = card.getAttribute('data-photo-id');
-                            viewPhoto(photoId);
-                        }
+                    card.tabIndex = 0;
+                    card.setAttribute('aria-label', `Preview photo ${card.dataset.photoId}`);
+                    card.setAttribute('aria-haspopup', 'dialog');
+                    card.addEventListener('click', event => {
+                        if (event.target.closest('a, button, input, select')) return;
+                        viewPhoto(card.dataset.photoId);
                     });
-                    
-                    // Close buttons when clicking outside on mobile
-                    document.addEventListener('click', function(e) {
-                        if (!card.contains(e.target)) {
-                            card.classList.remove('active');
+                    card.addEventListener('keydown', event => {
+                        if (event.target === card && ['Enter', ' '].includes(event.key)) {
+                            event.preventDefault();
+                            viewPhoto(card.dataset.photoId);
                         }
                     });
                 });
@@ -2171,13 +2216,209 @@ async def dashboard():
                 return `${size.toFixed(1)} ${units[unitIndex]}`;
             }
             
+            let photoPreview = null;
+
             function viewPhoto(photoId) {
-                notifyUserActivity(); // Track photo viewing
-                const photo = photos.find(p => p.id === photoId);
-                if (photo) {
-                    // Show dithered version if available, otherwise show original
-                    const imageToShow = photo.has_dithered ? photo.dithered_path : photo.original_path;
-                    window.open(imageToShow, '_blank');
+                const photo = photos.find(photo => photo.id === photoId);
+                if (!photo) return;
+                notifyUserActivity();
+                photoPreview = { photo, tab: photo.has_dithered ? 'dithered' : 'original', png: null,
+                    download: null, loading: false, sending: false, request: null, revision: 0, rotation: 0 };
+                document.getElementById('preview-title').textContent = photo.filename || photo.id;
+                const mode = document.getElementById('preview-mode');
+                mode.options[0].disabled = !photo.has_dithered;
+                mode.value = photo.has_dithered ? 'saved' : 'floyd_steinberg';
+                document.getElementById('preview-palette').value = 'blue_yellow';
+                document.getElementById('preview-palette-label').hidden = true;
+                document.getElementById('preview-status').textContent = '';
+                const card = Array.from(document.querySelectorAll('.photo-card')).find(card => card.dataset.photoId === photoId);
+                const actions = document.getElementById('preview-actions');
+                actions.replaceChildren(...Array.from(card.querySelector('.photo-actions').children, button => button.cloneNode(true)));
+                const links = actions.querySelectorAll('a');
+                links[0].dataset.previewAction = 'original';
+                let dithered = links[1];
+                if (!dithered) {
+                    dithered = links[0].cloneNode(true);
+                    dithered.lastChild.textContent = ' dithered';
+                    actions.insertBefore(dithered, actions.querySelector('button'));
+                }
+                dithered.dataset.previewAction = 'dithered';
+                links[0].onclick = downloadPhotoPreview;
+                dithered.onclick = downloadPhotoPreview;
+                actions.querySelector('button').onclick = sendPhotoPreview;
+                setPreviewTab(photoPreview.tab);
+                document.body.classList.add('preview-open');
+                document.getElementById('photo-preview').showModal();
+                if (!photo.has_dithered) generatePhotoPreview();
+            }
+
+            function closePhotoPreview() {
+                document.getElementById('photo-preview').close();
+            }
+
+            function setPreviewTab(tab) {
+                if (!photoPreview) return;
+                photoPreview.tab = tab;
+                for (const version of ['original', 'dithered']) {
+                    const button = document.getElementById(`preview-${version}-tab`);
+                    button.setAttribute('aria-selected', String(version === tab));
+                    button.tabIndex = version === tab ? 0 : -1;
+                }
+                document.getElementById('preview-panel').setAttribute('aria-labelledby', `preview-${tab}-tab`);
+                document.getElementById('preview-controls').hidden = tab !== 'dithered';
+                if (tab === 'dithered' && !photoPreview.photo.has_dithered && !photoPreview.png && !photoPreview.loading) {
+                    generatePhotoPreview();
+                } else {
+                    updatePhotoPreview();
+                }
+            }
+
+            function updatePhotoPreview() {
+                const state = photoPreview;
+                if (!state) return;
+                const saved = document.getElementById('preview-mode').value === 'saved';
+                const source = saved ? state.photo.dithered_path : state.png && `data:image/png;base64,${state.png}`;
+                const image = document.getElementById('preview-image');
+                const shown = state.tab === 'original' ? state.photo.original_path : source;
+                image.hidden = !shown;
+                if (shown) image.src = shown;
+                else image.removeAttribute('src');
+                image.alt = `${state.tab} preview of ${state.photo.filename || state.photo.id}`;
+                image.classList.toggle('dithered', state.tab === 'dithered');
+                image.classList.toggle('quarter-turn', state.rotation % 2 !== 0);
+                image.style.transform = `rotate(${state.rotation * 90}deg)`;
+                const actions = document.getElementById('preview-actions');
+                const download = actions.querySelector('[data-preview-action="dithered"]');
+                const ready = Boolean(source) && !state.loading;
+                download.setAttribute('aria-disabled', String(!ready));
+                download.tabIndex = ready ? 0 : -1;
+                if (ready) {
+                    download.href = saved ? `/api/download/dithered/${encodeURIComponent(state.photo.dithered_path.split('/').pop())}` : `data:image/png;base64,${state.download}`;
+                    download.download = saved ? '' : `${state.photo.id}_${document.getElementById('preview-mode').value}.png`;
+                } else download.removeAttribute('href');
+                actions.querySelector('button').disabled = state.loading || state.sending || (!saved && !ready);
+                document.getElementById('preview-mode').disabled = state.sending;
+                document.getElementById('preview-palette').disabled = state.sending;
+                for (const extension of actions.querySelectorAll('[data-extension-id]')) {
+                    extension.hidden = !saved;
+                }
+            }
+
+            function rotatePhotoPreview(direction) {
+                if (!photoPreview) return;
+                photoPreview.rotation = (photoPreview.rotation + direction + 4) % 4;
+                notifyUserActivity();
+                updatePhotoPreview();
+            }
+
+            async function rotatePreviewBlob(blob, rotation) {
+                const bitmap = await createImageBitmap(blob);
+                const canvas = document.createElement('canvas');
+                canvas.width = rotation % 2 ? bitmap.height : bitmap.width;
+                canvas.height = rotation % 2 ? bitmap.width : bitmap.height;
+                const context = canvas.getContext('2d');
+                context.imageSmoothingEnabled = false;
+                context.translate(canvas.width / 2, canvas.height / 2);
+                context.rotate(rotation * Math.PI / 2);
+                context.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+                bitmap.close();
+                return new Promise((resolve, reject) => canvas.toBlob(
+                    result => result ? resolve(result) : reject(new Error('Could not rotate download')),
+                    blob.type === 'image/jpeg' ? 'image/jpeg' : 'image/png', 0.95
+                ));
+            }
+
+            async function downloadPhotoPreview(event) {
+                event.stopPropagation();
+                const link = event.currentTarget;
+                const state = photoPreview;
+                if (!state || link.getAttribute('aria-disabled') === 'true') {
+                    event.preventDefault();
+                    return;
+                }
+                if (!state.rotation) return;
+                event.preventDefault();
+                const rotation = state.rotation;
+                const filename = link.dataset.previewAction === 'original'
+                    ? state.photo.filename : link.download || `${state.photo.id}_dithered.png`;
+                try {
+                    const response = await fetch(link.href);
+                    if (!response.ok) throw new Error('Could not download image');
+                    const rotated = await rotatePreviewBlob(await response.blob(), rotation);
+                    const download = document.createElement('a');
+                    download.href = URL.createObjectURL(rotated);
+                    download.download = filename || `${state.photo.id}.png`;
+                    document.body.appendChild(download);
+                    download.click();
+                    download.remove();
+                    setTimeout(() => URL.revokeObjectURL(download.href), 60000);
+                } catch (error) {
+                    if (photoPreview === state) document.getElementById('preview-status').textContent = error.message;
+                }
+            }
+
+            async function generatePhotoPreview() {
+                const state = photoPreview;
+                if (!state) return;
+                notifyUserActivity();
+                state.request?.abort();
+                const revision = ++state.revision;
+                const mode = document.getElementById('preview-mode').value;
+                state.png = null;
+                state.download = null;
+                state.loading = mode !== 'saved';
+                document.getElementById('preview-palette-label').hidden = mode !== 'gb-default-color';
+                document.getElementById('preview-status').textContent = state.loading ? 'generating preview...' : '';
+                updatePhotoPreview();
+                if (!state.loading) return;
+                state.request = new AbortController();
+                try {
+                    const response = await fetch(`/api/photos/${encodeURIComponent(state.photo.id)}/preview`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: state.request.signal,
+                        body: JSON.stringify({ dithering_method: mode, gb_color_palette: document.getElementById('preview-palette').value })
+                    });
+                    const result = await response.json();
+                    if (!response.ok || !result.png || !result.download_png) throw new Error(result.detail || 'Could not generate preview');
+                    if (photoPreview !== state || revision !== state.revision) return;
+                    state.png = result.png;
+                    state.download = result.download_png;
+                    document.getElementById('preview-status').textContent = '';
+                } catch (error) {
+                    if (photoPreview !== state || revision !== state.revision || error.name === 'AbortError') return;
+                    document.getElementById('preview-status').textContent = error.message;
+                } finally {
+                    if (photoPreview === state && revision === state.revision) {
+                        state.loading = false;
+                        updatePhotoPreview();
+                    }
+                }
+            }
+
+            async function sendPhotoPreview(event) {
+                event.stopPropagation();
+                const state = photoPreview;
+                if (!state || state.loading || state.sending) return;
+                const generated = document.getElementById('preview-mode').value !== 'saved';
+                if (generated && !state.png) return;
+                state.sending = true;
+                notifyUserActivity();
+                updatePhotoPreview();
+                document.getElementById('preview-status').textContent = 'sending to screen...';
+                try {
+                    const response = await fetch(generated ? '/api/preview/display' : `/api/display/${encodeURIComponent(state.photo.id)}`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: generated ? JSON.stringify({ png: state.png }) : undefined
+                    });
+                    const result = await response.json();
+                    if (!response.ok || result.success === false) throw new Error(result.detail || result.message || 'Could not display photo');
+                    if (photoPreview === state) document.getElementById('preview-status').textContent = result.message || 'sent to screen';
+                } catch (error) {
+                    if (photoPreview === state) document.getElementById('preview-status').textContent = error.message;
+                } finally {
+                    if (photoPreview === state) {
+                        state.sending = false;
+                        updatePhotoPreview();
+                    }
                 }
             }
             
@@ -3122,6 +3363,27 @@ async def dashboard():
             
             // Load photos on page load
             document.addEventListener('DOMContentLoaded', function() {
+                const preview = document.getElementById('photo-preview');
+                preview.addEventListener('click', event => {
+                    if (event.target !== preview) return;
+                    const bounds = preview.getBoundingClientRect();
+                    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closePhotoPreview();
+                });
+                preview.addEventListener('close', () => {
+                    if (preview.open) return;
+                    photoPreview?.request?.abort();
+                    photoPreview = null;
+                    document.body.classList.remove('preview-open');
+                    document.getElementById('preview-image').removeAttribute('src');
+                    document.getElementById('preview-actions').replaceChildren();
+                });
+                preview.querySelector('[role="tablist"]').addEventListener('keydown', event => {
+                    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                    event.preventDefault();
+                    const tab = event.key === 'Home' ? 'original' : event.key === 'End' ? 'dithered' : photoPreview.tab === 'original' ? 'dithered' : 'original';
+                    setPreviewTab(tab);
+                    document.getElementById(`preview-${tab}-tab`).focus();
+                });
                 loadPhotos(currentPage);
                 updateAutoRefreshInterval();
                 updateBatteryLevel();
@@ -3527,6 +3789,34 @@ async def reprocess_photo(photo_id: str, request: Request):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/photos/{photo_id}/preview")
+async def preview_photo(photo_id: str, body: Dict[str, Any]):
+    try:
+        result = await reframe_client.post(f"/photos/{photo_id}/preview", json=body)
+        result["download_png"] = result["png"]
+        if settings_manager.load_settings().get("exports", {}).get("upscale_dithered_2x", False):
+            with Image.open(BytesIO(base64.b64decode(result["png"]))) as image:
+                enlarged = image.resize((image.width * 2, image.height * 2), Image.Resampling.NEAREST)
+                output = BytesIO()
+                enlarged.save(output, format="PNG")
+                result["download_png"] = base64.b64encode(output.getvalue()).decode("ascii")
+        return result
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=error.response.status_code, detail="Could not generate preview") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Preview service unavailable") from error
+
+
+@app.post("/api/preview/display")
+async def display_preview(body: Dict[str, Any]):
+    try:
+        return await reframe_client.post("/preview/display", json=body)
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=error.response.status_code, detail="Could not display preview") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Display service unavailable") from error
+
 
 @app.get("/api/status")
 async def get_system_status():

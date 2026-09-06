@@ -6,6 +6,8 @@ import json
 import subprocess
 import logging
 import socket
+import base64
+from io import BytesIO
 from time import sleep
 
 # Lazy-loaded by _lazy_import_pil() on first use
@@ -1252,19 +1254,12 @@ class ImageProcessor:
         return buf
 
     @staticmethod
-    def process_photo_with_settings(original_path, output_path, processing_settings):
-        """Process a photo with specific settings and save it."""
-        try:
-            Image, ImageEnhance = _lazy_import_pil()
-
-            # Load original image
-            original_image = Image.open(original_path)
-
-            # Resize image
+    def render_photo_with_settings(original_path, processing_settings):
+        """Render without persistence; callers decide whether to save the result."""
+        Image, ImageEnhance = _lazy_import_pil()
+        with Image.open(original_path) as original_image:
             resized_image = ImageProcessor.resize_image(original_image)
-
-            # Apply processing with settings
-            dithered_image = ImageProcessor.apply_dithering(
+            return ImageProcessor.apply_dithering(
                 resized_image,
                 saturation=processing_settings.get("saturation", 0.6),
                 brightness_factor=processing_settings.get("brightness_factor", 1.1),
@@ -1274,6 +1269,14 @@ class ImageProcessor:
                 threshold_scale=processing_settings.get("threshold_scale", 1.0),
                 tone_map=processing_settings.get("tone_map", "percentile"),
                 gb_color_palette=processing_settings.get("gb_color_palette", "blue_yellow")
+            )
+
+    @staticmethod
+    def process_photo_with_settings(original_path, output_path, processing_settings):
+        """Process a photo with specific settings and save it."""
+        try:
+            dithered_image = ImageProcessor.render_photo_with_settings(
+                original_path, processing_settings
             )
 
             # Save processed image as PNG (keep palette if present)
@@ -2142,6 +2145,50 @@ def _create_fastapi_routes():
             processing_settings = None
         with _operation_lock:
             result = camera_system.reprocess_photo_api(photo_id, processing_settings)
+        return result
+
+    @app.post("/api/photos/{photo_id}/preview")
+    def api_preview_photo(photo_id: str, body: Dict[str, Any]):
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        mode = body.get("dithering_method")
+        if mode not in ("floyd_steinberg", "ordered", "bayer_natural_pair", "gb-default", "gb-default-color"):
+            raise HTTPException(status_code=400, detail="Unsupported dithering mode")
+        palette = body.get("gb_color_palette", "blue_yellow")
+        if palette not in ("blue_yellow", "green_yellow", "red_yellow", "blue_red", "blue_green"):
+            raise HTTPException(status_code=400, detail="Unsupported color palette")
+        with _operation_lock:
+            photo = camera_system.get_photo_info_api(photo_id)
+            if not photo:
+                raise HTTPException(status_code=404, detail="Photo not found")
+            camera_system.update_activity()
+            settings = dict(camera_system.camera_manager.settings.get("processing", {}))
+            settings.update(dithering_method=mode, gb_color_palette=palette)
+            image = ImageProcessor.render_photo_with_settings(photo["original_path"], settings)
+            output = BytesIO()
+            image.save(output, format="PNG")
+        return {"png": base64.b64encode(output.getvalue()).decode("ascii")}
+
+    @app.post("/api/preview/display")
+    def api_display_preview(body: Dict[str, Any]):
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        encoded = body.get("png")
+        if not isinstance(encoded, str) or len(encoded) > 2_000_000:
+            raise HTTPException(status_code=400, detail="Invalid preview image")
+        try:
+            Image, _ = _lazy_import_pil()
+            with Image.open(BytesIO(base64.b64decode(encoded, validate=True))) as image:
+                if image.format != "PNG" or image.size != DISPLAY_IMAGE_SIZE:
+                    raise ValueError("Preview must be a display-sized PNG")
+                buffer = ImageProcessor.img2buffer(image)
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Invalid preview image") from error
+        with _operation_lock:
+            camera_system.update_activity()
+            result = camera_system.eink_display.display_buffer_async(buffer)
+        if result.get("success"):
+            result["message"] = "Preview sent to screen"
         return result
 
     @app.get("/api/photos")
