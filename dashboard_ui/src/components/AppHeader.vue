@@ -7,7 +7,7 @@ defineProps({
   carouselBusy: { type: Boolean, default: false },
 })
 
-defineEmits(['refresh', 'capture', 'settings', 'toggle-carousel'])
+defineEmits(['refresh', 'capture', 'live-preview', 'settings', 'toggle-carousel'])
 </script>
 
 <template>
@@ -28,6 +28,7 @@ defineEmits(['refresh', 'capture', 'settings', 'toggle-carousel'])
         <button class="button button-light" type="button" :disabled="carouselBusy" @click="$emit('toggle-carousel')">
           {{ carouselBusy ? 'updating...' : carouselActive ? 'stop carousel' : 'start carousel' }}
         </button>
+        <button class="button button-light" type="button" @click="$emit('live-preview')">live preview</button>
         <button class="button" type="button" :disabled="captureBusy" @click="$emit('capture')">
           {{ captureBusy ? 'capturing...' : 'capture photo' }}
         </button>

@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 import httpx
 from PIL import Image
@@ -383,6 +383,19 @@ class ReframeClient:
             resp = await client.delete(url)
             resp.raise_for_status()
             return resp.json()
+
+    async def open_stream(self, path: str):
+        """Open a long-lived upstream stream and return its owned resources."""
+        url = f"{self.base_url}{path}"
+        timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+        client = httpx.AsyncClient(timeout=timeout)
+        stream_context = client.stream("GET", url)
+        try:
+            response = await stream_context.__aenter__()
+        except Exception:
+            await client.aclose()
+            raise
+        return client, stream_context, response
 
 
 async def run_repo_command(args: List[str], timeout: int = 30) -> Dict[str, Any]:
@@ -1215,6 +1228,59 @@ async def capture_photo(background_tasks: BackgroundTasks):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/preview/stream")
+async def preview_stream(request: Request):
+    """Forward the hardware MJPEG stream without buffering it."""
+    try:
+        stream_path = "/preview/stream"
+        if request.url.query:
+            stream_path += f"?{request.url.query}"
+        client, stream_context, response = await reframe_client.open_stream(stream_path)
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Preview service unavailable") from error
+
+    if response.status_code >= 400:
+        try:
+            await response.aread()
+            try:
+                detail = response.json().get("detail", "Preview unavailable")
+            except ValueError:
+                detail = "Preview unavailable"
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    async def byte_stream():
+        try:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+        finally:
+            await stream_context.__aexit__(None, None, None)
+            await client.aclose()
+
+    return StreamingResponse(
+        byte_stream(),
+        headers={
+            "Content-Type": response.headers.get(
+                "content-type", "multipart/x-mixed-replace; boundary=frame"
+            ),
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+    )
+
+@app.post("/api/preview/stop")
+async def stop_preview(request: Request):
+    """Release the caller's hardware preview session."""
+    try:
+        stop_path = "/preview/stop"
+        if request.url.query:
+            stop_path += f"?{request.url.query}"
+        return await reframe_client.post(stop_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to stop preview: {e}")
 
 @app.post("/api/display/clear")
 async def clear_display():

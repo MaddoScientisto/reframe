@@ -1,6 +1,7 @@
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import AppHeader from './components/AppHeader.vue'
+import LivePreviewDialog from './components/LivePreviewDialog.vue'
 import PhotoGallery from './components/PhotoGallery.vue'
 import PhotoPreviewDialog from './components/PhotoPreviewDialog.vue'
 import SettingsModal from './components/SettingsModal.vue'
@@ -47,6 +48,7 @@ const carouselActive = ref(false)
 const carouselBusy = ref(false)
 const busyAction = ref('')
 const selectedPhoto = ref(null)
+const livePreviewOpen = ref(false)
 const settingsOpen = ref(false)
 const settings = ref(null)
 const settingsLoading = ref(false)
@@ -57,6 +59,13 @@ const notification = ref(null)
 let notificationTimer = null
 let batteryTimer = null
 let refreshTimer = null
+
+const previewAspectRatio = computed(() => {
+  const resolution = settings.value?.camera?.resolution
+  const width = Number(resolution?.width)
+  const height = Number(resolution?.height)
+  return width > 0 && height > 0 ? `${width} / ${height}` : '3 / 2'
+})
 
 const downloadJob = useLongRunningJob({
   start: startDownload,
@@ -201,6 +210,15 @@ async function handleCapture() {
   } finally {
     captureBusy.value = false
   }
+}
+
+async function openLivePreview() {
+  await notifyUserActivity()
+  livePreviewOpen.value = true
+}
+
+function closeLivePreview() {
+  livePreviewOpen.value = false
 }
 
 async function handleCarouselToggle() {
@@ -402,6 +420,7 @@ onUnmounted(() => {
       :carousel-busy="carouselBusy"
       @refresh="loadPhotos(currentPage)"
       @capture="handleCapture"
+      @live-preview="openLivePreview"
       @toggle-carousel="handleCarouselToggle"
       @settings="openSettings"
     />
@@ -428,6 +447,13 @@ onUnmounted(() => {
       @close="closePreview"
       @notify="notify($event, 'success')"
       @carousel-updated="handleCarouselUpdated"
+    />
+    <LivePreviewDialog
+      :open="livePreviewOpen"
+      :capture-busy="captureBusy"
+      :aspect-ratio="previewAspectRatio"
+      @close="closeLivePreview"
+      @capture="handleCapture"
     />
     <SettingsModal
       :open="settingsOpen"

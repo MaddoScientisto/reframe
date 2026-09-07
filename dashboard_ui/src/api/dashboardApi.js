@@ -21,6 +21,11 @@ export function capturePhoto() {
   return request('/api/capture', { method: 'POST' })
 }
 
+export function stopPreview(clientId) {
+  const params = new URLSearchParams({ client_id: clientId })
+  return request(`/api/preview/stop?${params.toString()}`, { method: 'POST' })
+}
+
 export function getCarouselStatus() {
   return request('/api/carousel/status')
 }

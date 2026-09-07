@@ -3,6 +3,8 @@
 import os
 import sys
 import json
+import asyncio
+import math
 import subprocess
 import logging
 import socket
@@ -43,14 +45,16 @@ _API_AVAILABLE = None
 FastAPI = None
 HTTPException = None
 Request = None
+StreamingResponse = None
 uvicorn = None
 
 def _lazy_import_fastapi():
     """Import FastAPI/uvicorn only when needed."""
-    global _API_AVAILABLE, FastAPI, HTTPException, Request, uvicorn
+    global _API_AVAILABLE, FastAPI, HTTPException, Request, StreamingResponse, uvicorn
     if _API_AVAILABLE is None:
         try:
             from fastapi import FastAPI, HTTPException, Request
+            from fastapi.responses import StreamingResponse
             import uvicorn
             _API_AVAILABLE = True
         except Exception:
@@ -58,6 +62,7 @@ def _lazy_import_fastapi():
             FastAPI = None
             HTTPException = None
             Request = None
+            StreamingResponse = None
             uvicorn = None
     return _API_AVAILABLE
 
@@ -91,6 +96,9 @@ DISPLAY_PANEL_HEIGHT = 600
 DISPLAY_IMAGE_SIZE = (DISPLAY_IMAGE_WIDTH, DISPLAY_IMAGE_HEIGHT)
 DISPLAY_PANEL_SIZE = (DISPLAY_PANEL_WIDTH, DISPLAY_PANEL_HEIGHT)
 BUTTON_POLL_INTERVAL_SECONDS = 0.025
+LIVE_PREVIEW_MAX_SIZE = (640, 480)
+LIVE_PREVIEW_FPS = 5
+LIVE_PREVIEW_JPEG_QUALITY = 75
 
 # Color palettes for dithering. We blend between the two to create a saturated look while preserving details.
 # Idea from https://github.com/pimoroni/inky
@@ -139,6 +147,142 @@ def get_dashboard_access_info(hostname=None, ip_address=None):
         "fallback_url": fallback_url,
         "marker": marker
     }
+
+
+def yuv420_to_image(frame, size):
+    """Convert Picamera2's packed planar YUV420 frame to an RGB image."""
+    numpy = _lazy_import_numpy()
+    image_class, _ = _lazy_import_pil()
+    width, height = size
+    array = numpy.asarray(frame)
+    expected_rows = height + height // 2
+    if (
+        width % 2
+        or height % 4
+        or array.ndim != 2
+        or array.shape[0] < expected_rows
+        or array.shape[1] < width
+    ):
+        raise RuntimeError(
+            f"unexpected YUV420 frame shape {array.shape}; expected at least "
+            f"({expected_rows}, {width})"
+        )
+
+    y_plane = array[:height, :width].astype(numpy.float32)
+    chroma_rows = height // 4
+    u_plane = array[height:height + chroma_rows, :width].reshape(height // 2, width // 2)
+    v_start = height + chroma_rows
+    v_plane = array[v_start:v_start + chroma_rows, :width].reshape(height // 2, width // 2)
+    u_plane = numpy.repeat(numpy.repeat(u_plane, 2, axis=0), 2, axis=1).astype(numpy.float32)
+    v_plane = numpy.repeat(numpy.repeat(v_plane, 2, axis=0), 2, axis=1).astype(numpy.float32)
+
+    red = y_plane + 1.402 * (v_plane - 128.0)
+    green = y_plane - 0.344136 * (u_plane - 128.0) - 0.714136 * (v_plane - 128.0)
+    blue = y_plane + 1.772 * (u_plane - 128.0)
+    rgb = numpy.clip(numpy.stack((red, green, blue), axis=2), 0, 255).astype(numpy.uint8)
+    return image_class.fromarray(rgb, mode="RGB")
+
+
+def get_preview_size(resolution):
+    """Choose a YUV420 preview size with the exact still-image aspect ratio."""
+    still_width = int(resolution["width"])
+    still_height = int(resolution["height"])
+    ratio_width = still_width // math.gcd(still_width, still_height)
+    ratio_height = still_height // math.gcd(still_width, still_height)
+    max_width, max_height = LIVE_PREVIEW_MAX_SIZE
+    scale = min(max_width // ratio_width, max_height // ratio_height)
+
+    while scale > 0:
+        preview_width = ratio_width * scale
+        preview_height = ratio_height * scale
+        if preview_width % 2 == 0 and preview_height % 4 == 0:
+            return preview_width, preview_height
+        scale -= 1
+
+    raise ValueError(f"Could not derive an aligned preview size for {still_width}x{still_height}")
+
+
+class PreviewSessionBusy(RuntimeError):
+    pass
+
+
+class CameraPreviewSession:
+    """Keep one encoded preview frame available for a single HTTP client."""
+
+    def __init__(self, camera_manager, owner_id=None):
+        self.camera_manager = camera_manager
+        self.owner_id = owner_id
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._active = False
+        self._sequence = 0
+        self._latest_frame = None
+
+    def start(self):
+        with self._condition:
+            if self._active:
+                raise PreviewSessionBusy("Live preview is already in use")
+            self._active = True
+            self._thread = threading.Thread(
+                target=self._run,
+                name="camera-preview",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def is_active(self):
+        with self._condition:
+            return self._active
+
+    def stop(self):
+        with self._condition:
+            self._active = False
+            self._stop_event.set()
+            self._condition.notify_all()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+
+    def wait_for_frame(self, after_sequence, timeout=2):
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._active and self._sequence <= after_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+            if self._sequence <= after_sequence:
+                return None
+            return self._sequence, self._latest_frame
+
+    def _run(self):
+        interval = 1 / LIVE_PREVIEW_FPS
+        next_deadline = time.monotonic()
+        try:
+            while not self._stop_event.is_set():
+                frame_started = time.monotonic()
+                try:
+                    jpeg = self.camera_manager.capture_preview_jpeg()
+                except Exception:
+                    logging.exception("Live preview capture failed")
+                    break
+
+                if jpeg is not None:
+                    with self._condition:
+                        self._latest_frame = jpeg
+                        self._sequence += 1
+                        self._condition.notify_all()
+
+                next_deadline += interval
+                delay = next_deadline - time.monotonic()
+                if delay > 0:
+                    self._stop_event.wait(delay)
+                elif time.monotonic() - frame_started > interval:
+                    next_deadline = time.monotonic()
+        finally:
+            with self._condition:
+                self._active = False
+                self._condition.notify_all()
 
 
 def get_lan_ip_address():
@@ -266,6 +410,9 @@ class CameraManager:
         self.settings_path = settings_path
         self.settings = self.load_settings()
         self.picam2 = Picamera2()
+        self._camera_lock = threading.Lock()
+        self._preview_session_lock = threading.Lock()
+        self._preview_session = None
         self.last_activity_monotonic = time.monotonic()
         self._has_captured = False  # Track if we've taken at least one photo (for adaptive AF)
         self.configure_camera()
@@ -350,13 +497,13 @@ class CameraManager:
         if "autofocus_mode" in camera_settings:
             controls["AfMode"] = camera_settings["autofocus_mode"]
 
-        # Apply controls one by one to handle unsupported controls gracefully
-        for control_name, control_value in controls.items():
-            try:
-                self.picam2.set_controls({control_name: control_value})
-                logging.info(f"Applied {control_name}: {control_value}")
-            except Exception as e:
-                logging.warning(f"Could not set {control_name}: {e}")
+        with self._camera_lock:
+            for control_name, control_value in controls.items():
+                try:
+                    self.picam2.set_controls({control_name: control_value})
+                    logging.info(f"Applied {control_name}: {control_value}")
+                except Exception as e:
+                    logging.warning(f"Could not set {control_name}: {e}")
 
     def capture_photo_with_metadata(self, file_path=None, fast_mode=False):
         """Capture a photo and return metadata like the dashboard API."""
@@ -416,45 +563,109 @@ class CameraManager:
         """Configure the camera settings."""
         camera_settings = self.settings.get("camera", {})
         resolution = camera_settings.get("resolution", {"width": 1200, "height": 800})
+        self.preview_size = get_preview_size(resolution)
+        self.stop_preview()
 
-        # Safely stop the camera before reconfiguring to avoid runtime errors
-        try:
-            self.picam2.stop()
-        except Exception:
-            pass
+        with self._camera_lock:
+            try:
+                self.picam2.stop()
+            except Exception:
+                pass
 
-        camera_config = self.picam2.create_still_configuration(
-            main={"size": (resolution["width"], resolution["height"])}
-        )
-
-        # Build controls dictionary from settings
-        controls = {
-            "ExposureValue": camera_settings.get("exposure_value", 0),
-            "Sharpness": camera_settings.get("sharpness", 3)
-        }
-
-
-        camera_config["controls"] = controls
-
-        try:
-            self.picam2.configure(camera_config)
-        except Exception as e:
-            logging.error(f"Error configuring camera: {e}")
-            # Try with basic configuration without custom controls
-            basic_config = self.picam2.create_still_configuration(
-                main={"size": (resolution["width"], resolution["height"])}
+            camera_config = self.picam2.create_still_configuration(
+                main={
+                    "size": (resolution["width"], resolution["height"]),
+                    "format": "RGB888",
+                },
+                lores={"size": self.preview_size, "format": "YUV420"},
+                buffer_count=3,
             )
-            self.picam2.configure(basic_config)
-            logging.info("Using basic camera configuration")
 
-        # Set autofocus mode safely
+            controls = {
+                "ExposureValue": camera_settings.get("exposure_value", 0),
+                "Sharpness": camera_settings.get("sharpness", 3)
+            }
+            camera_config["controls"] = controls
+
+            try:
+                self.picam2.configure(camera_config)
+            except Exception as e:
+                logging.error(f"Error configuring camera: {e}")
+                basic_config = self.picam2.create_still_configuration(
+                    main={
+                        "size": (resolution["width"], resolution["height"]),
+                        "format": "RGB888",
+                    },
+                    lores={"size": self.preview_size, "format": "YUV420"},
+                    buffer_count=3,
+                )
+                self.picam2.configure(basic_config)
+                logging.info("Using basic camera configuration")
+
+            try:
+                af_mode = camera_settings.get("autofocus_mode", 2)
+                self.picam2.set_controls({"AfMode": af_mode})
+            except Exception as e:
+                logging.warning(f"Could not set autofocus mode: {e}")
+
+            self.picam2.start()
+
+    def open_preview_session(self, owner_id=None):
+        """Start the single browser-facing live preview session."""
+        with self._preview_session_lock:
+            if self._preview_session is not None and self._preview_session.is_active():
+                raise PreviewSessionBusy("Live preview is already in use")
+            previous = self._preview_session
+            session = CameraPreviewSession(self, owner_id)
+            self._preview_session = session
+            try:
+                session.start()
+            except Exception:
+                self._preview_session = previous
+                raise
+        if previous is not None:
+            previous.stop()
+        return session
+
+    def close_preview_session(self, session):
+        """Stop a preview session and release its camera worker."""
+        with self._preview_session_lock:
+            if self._preview_session is session:
+                self._preview_session = None
+        session.stop()
+
+    def close_preview_session_for_owner(self, owner_id):
+        """Stop a preview session only when the caller owns it."""
+        with self._preview_session_lock:
+            session = self._preview_session
+            if session is None or session.owner_id != owner_id:
+                return False
+            self._preview_session = None
+        session.stop()
+        return True
+
+    def stop_preview(self):
+        with self._preview_session_lock:
+            session = self._preview_session
+            self._preview_session = None
+        if session is not None:
+            session.stop()
+
+    def capture_preview_jpeg(self):
+        """Capture and encode one lores frame, or skip a busy camera cycle."""
+        if not self._camera_lock.acquire(blocking=False):
+            return None
         try:
-            af_mode = camera_settings.get("autofocus_mode", 2)
-            self.picam2.set_controls({"AfMode": af_mode})
-        except Exception as e:
-            logging.warning(f"Could not set autofocus mode: {e}")
+            frame = self.picam2.capture_array("lores")
+            frame = _lazy_import_numpy().array(frame, copy=True)
+        finally:
+            self._camera_lock.release()
 
-        self.picam2.start()
+        self.update_activity_time()
+        image = yuv420_to_image(frame, self.preview_size)
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=LIVE_PREVIEW_JPEG_QUALITY)
+        return output.getvalue()
 
     def update_activity_time(self):
         """Update the last activity timestamp."""
@@ -499,13 +710,15 @@ class CameraManager:
     def capture_photo(self, file_path, fast_mode=False):
         """Capture a photo and save it to the specified file path."""
         self._settle_autofocus(fast_mode)
-        self.picam2.capture_file(file_path)  # Capture the photo
+        with self._camera_lock:
+            self.picam2.capture_file(file_path)
         logging.info(f"Photo saved to {file_path}")
 
     def capture_image(self, fast_mode=False):
         """Capture a photo into memory as a PIL image."""
         self._settle_autofocus(fast_mode)
-        image = self.picam2.capture_image("main")
+        with self._camera_lock:
+            image = self.picam2.capture_image("main")
         logging.info("Photo captured to memory")
         return image
 
@@ -2266,6 +2479,59 @@ def _create_fastapi_routes():
         camera_system.update_activity()
         return camera_system.carousel_status_api()
 
+    @app.get("/api/preview/stream")
+    async def api_preview_stream(request: Request):
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        camera_manager = camera_system.camera_manager
+        try:
+            session = camera_manager.open_preview_session(request.query_params.get("client_id"))
+        except PreviewSessionBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:
+            logging.exception("Could not start live preview")
+            raise HTTPException(status_code=503, detail="Camera preview unavailable") from error
+
+        first_frame = await asyncio.to_thread(session.wait_for_frame, 0, 3)
+        if first_frame is None:
+            camera_manager.close_preview_session(session)
+            raise HTTPException(status_code=503, detail="Camera preview unavailable")
+
+        async def frame_stream():
+            sequence = 0
+            try:
+                while not await request.is_disconnected():
+                    frame = await asyncio.to_thread(session.wait_for_frame, sequence)
+                    if frame is None:
+                        break
+                    sequence, jpeg = frame
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                        + jpeg
+                        + b"\r\n"
+                    )
+            finally:
+                camera_manager.close_preview_session(session)
+
+        return StreamingResponse(
+            frame_stream(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        )
+
+    @app.post("/api/preview/stop")
+    def api_preview_stop(client_id: str = ""):
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Preview client ID is required")
+        stopped = camera_system.camera_manager.close_preview_session_for_owner(client_id)
+        return {"success": stopped}
+
     @app.post("/api/carousel/start")
     def api_carousel_start():
         global camera_system
@@ -2655,6 +2921,7 @@ def main():
             if camera_system:
                 camera_system.stop_timeout_monitor()
                 camera_system.stop_dashboard_qr_monitor()
+                camera_system.camera_manager.stop_preview()
                 if camera_system.eink_display:
                     camera_system.eink_display.sleep()
         except Exception:

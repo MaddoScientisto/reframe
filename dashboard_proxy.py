@@ -81,6 +81,11 @@ class DashboardProxyHandler(BaseHTTPRequestHandler):
                 body,
                 headers,
             )
+            is_preview_stream = self.path.split("?", 1)[0] == "/api/preview/stream"
+            if is_preview_stream and response.status < 400:
+                self._forward_stream(response, send_body)
+                return
+
             response_body = response.read()
 
             self.send_response(response.status, response.reason)
@@ -118,6 +123,34 @@ class DashboardProxyHandler(BaseHTTPRequestHandler):
                 conn.close()
             except Exception:
                 pass
+
+    def _forward_stream(self, response, send_body):
+        self.send_response(response.status, response.reason)
+        for key, value in response.getheaders():
+            if key.lower() in {"connection", "content-length", "keep-alive", "transfer-encoding"}:
+                continue
+            self.send_header(key, value)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if not send_body:
+            return
+
+        read_chunk = getattr(response, "read1", response.read)
+        try:
+            while True:
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    return
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return
+        except OSError as exc:
+            if exc.errno in {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED}:
+                return
+            raise
 
     def log_message(self, fmt, *args):
         print("%s - - [%s] %s" % (self.address_string(), self.log_date_time_string(), fmt % args), flush=True)
