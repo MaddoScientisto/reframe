@@ -74,7 +74,9 @@ A web dashboard, accessible over the local network, lets you browse photos, down
 ```
 reframe/
 ├── reframe.py                 # main camera application
-├── dashboard.py               # web dashboard for photo management
+├── dashboard.py               # dashboard API and camera operations
+├── dashboard_presenter.py     # serves the compiled Vue dashboard
+├── dashboard_ui/               # Vue source and production build
 ├── dashboard_proxy.py         # local port 80 dashboard proxy
 ├── install.sh                 # one-command setup script
 ├── settings.example.json      # default configuration
