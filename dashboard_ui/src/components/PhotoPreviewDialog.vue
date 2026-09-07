@@ -249,7 +249,7 @@ onUnmounted(cancelPreviewRequest)
 </script>
 
 <template>
-  <dialog ref="dialogRef" class="preview-dialog" aria-labelledby="preview-title" @close="handleClose">
+  <dialog ref="dialogRef" class="preview-dialog photo-preview-dialog" aria-labelledby="preview-title" @close="handleClose">
     <div class="dialog-header">
       <h2 id="preview-title">{{ photo?.filename || photo?.id }}</h2>
       <label class="carousel-toggle">

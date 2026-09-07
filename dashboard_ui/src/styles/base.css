@@ -711,6 +711,33 @@ select {
     flex: 0 0 auto;
   }
 
+  .photo-preview-dialog .dialog-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .photo-preview-dialog .dialog-header h2 {
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .photo-preview-dialog .carousel-toggle {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    margin-left: 0;
+  }
+
+  .photo-preview-dialog .icon-button {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+
   .settings-grid {
     grid-template-columns: 1fr;
   }
