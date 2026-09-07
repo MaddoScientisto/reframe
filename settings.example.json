@@ -24,6 +24,11 @@
     "interrupt_refresh_on_capture": false,
     "refresh_interrupt_action": "reset"
   },
+  "carousel": {
+    "interval_seconds": 30,
+    "photo_ids": [],
+    "shuffle": false
+  },
   "system": {
     "auto_refresh_interval": 30,
     "auto_timeout_minutes": 10,

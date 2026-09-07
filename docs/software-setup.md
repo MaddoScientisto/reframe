@@ -119,7 +119,7 @@ Open a browser on any device connected to the same network:
 http://reframe.local
 ```
 
-The dashboard lets you browse photos, download originals, change the displayed image, and adjust camera settings.
+The dashboard lets you browse photos, download originals, change the displayed image, adjust camera settings, and run a timed carousel. Open a photo's detail view to include it in the carousel; included photos receive a gold border and are also available in the carousel tab. The carousel duration and optional Fisher-Yates shuffle-at-start mode are configured under settings. Changing membership while the carousel runs updates its queue in place, and pressing the shutter stops carousel mode before capturing a new photo.
 
 The dashboard also remains available on port 8000 as a fallback:
 

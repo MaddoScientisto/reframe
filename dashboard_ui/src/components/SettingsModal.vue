@@ -48,6 +48,11 @@ function defaultSettings() {
       interrupt_refresh_on_capture: false,
       refresh_interrupt_action: 'reset',
     },
+    carousel: {
+      interval_seconds: 30,
+      photo_ids: [],
+      shuffle: false,
+    },
     system: {
       auto_refresh_interval: 30,
       auto_timeout_minutes: 10,
@@ -228,6 +233,13 @@ function formatJobMessage(job, percent) {
               <option value="blue_green">black / blue / green / white</option>
             </select>
           </label>
+        </section>
+
+        <section class="settings-section">
+          <h3>carousel mode</h3>
+          <label class="setting-row">image duration (seconds) <input v-model.number="draft.carousel.interval_seconds" type="number" min="1" max="3600" step="1" /></label>
+          <label class="setting-row">shuffle at carousel start <select v-model="draft.carousel.shuffle"><option :value="false">disabled</option><option :value="true">enabled</option></select></label>
+          <p class="setting-help">Carousel images are selected from each photo's detail view.</p>
         </section>
 
         <section class="settings-section">

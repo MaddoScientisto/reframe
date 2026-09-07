@@ -13,6 +13,7 @@ import {
   displayControl,
   displayPhoto,
   getBattery,
+  getCarouselStatus,
   getDeleteProgress,
   getDownloadProgress,
   getExtensionActions,
@@ -23,13 +24,17 @@ import {
   runExtensionAction,
   saveSettings,
   showDashboardQr,
+  startCarousel,
   startDelete,
   startDownload,
+  stopCarousel,
 } from './api/dashboardApi'
 
 const photosPerPage = 12
 const initialPage = Number.parseInt(new URLSearchParams(window.location.search).get('page'), 10)
+const initialView = new URLSearchParams(window.location.search).get('view') === 'carousel'
 const currentPage = ref(Number.isInteger(initialPage) && initialPage > 0 ? initialPage : 1)
+const carouselOnly = ref(initialView)
 const photos = ref([])
 const pagination = ref({ total_pages: 1, total_photos: 0, has_prev: false, has_next: false, limit: photosPerPage })
 const extensionActions = ref([])
@@ -38,6 +43,8 @@ const galleryError = ref('')
 const latestPhotoLoadRequest = ref(0)
 const batteryLevel = ref(null)
 const captureBusy = ref(false)
+const carouselActive = ref(false)
+const carouselBusy = ref(false)
 const busyAction = ref('')
 const selectedPhoto = ref(null)
 const settingsOpen = ref(false)
@@ -78,6 +85,8 @@ function updatePageUrl() {
   const url = new URL(window.location.href)
   if (currentPage.value === 1) url.searchParams.delete('page')
   else url.searchParams.set('page', currentPage.value)
+  if (carouselOnly.value) url.searchParams.set('view', 'carousel')
+  else url.searchParams.delete('view')
   window.history.replaceState({}, '', url)
 }
 
@@ -106,7 +115,7 @@ async function loadPhotos(page = currentPage.value) {
   galleryError.value = ''
   await loadExtensionActions()
   try {
-    const result = await getPhotos(requestedPage, photosPerPage)
+    const result = await getPhotos(requestedPage, photosPerPage, carouselOnly.value)
     if (requestId !== latestPhotoLoadRequest.value) return
     const totalPages = Math.max(1, result.pagination?.total_pages || 1)
     if (requestedPage > totalPages) {
@@ -137,6 +146,15 @@ async function loadInitialSettings() {
     configureRefreshTimer()
   } catch {
     // Settings are loaded again when the modal opens.
+  }
+}
+
+async function loadCarouselStatus() {
+  try {
+    const result = await getCarouselStatus()
+    carouselActive.value = Boolean(result.active)
+  } catch {
+    carouselActive.value = false
   }
 }
 
@@ -172,6 +190,7 @@ async function handleSaveSettings(payload) {
 
 async function handleCapture() {
   captureBusy.value = true
+  carouselActive.value = false
   await notifyUserActivity()
   try {
     const result = await capturePhoto()
@@ -181,6 +200,20 @@ async function handleCapture() {
     notify(error.message || 'Could not capture photo', 'error')
   } finally {
     captureBusy.value = false
+  }
+}
+
+async function handleCarouselToggle() {
+  carouselBusy.value = true
+  await notifyUserActivity()
+  try {
+    const result = carouselActive.value ? await stopCarousel() : await startCarousel()
+    carouselActive.value = Boolean(result.active)
+    notify(result.message || (carouselActive.value ? 'Carousel started' : 'Carousel stopped'), 'success')
+  } catch (error) {
+    notify(error.message || 'Could not update carousel mode', 'error')
+  } finally {
+    carouselBusy.value = false
   }
 }
 
@@ -225,6 +258,26 @@ function changePage(page) {
   if (target === currentPage.value) return
   notifyUserActivity()
   loadPhotos(target)
+}
+
+function changeView(nextView) {
+  const nextCarouselOnly = nextView === 'carousel'
+  if (nextCarouselOnly === carouselOnly.value) return
+  carouselOnly.value = nextCarouselOnly
+  currentPage.value = 1
+  notifyUserActivity()
+  loadPhotos(1)
+}
+
+async function handleCarouselUpdated({ id, included }) {
+  photos.value = photos.value.map((photo) => (
+    photo.id === id ? { ...photo, carousel_enabled: included } : photo
+  ))
+  if (selectedPhoto.value?.id === id) {
+    selectedPhoto.value = { ...selectedPhoto.value, carousel_enabled: included }
+  }
+  await loadCarouselStatus()
+  await loadPhotos(currentPage.value)
 }
 
 async function handleDisplayControl(action) {
@@ -318,7 +371,7 @@ watch(() => deleteJob.state.value.status, async (status) => {
 })
 
 onMounted(async () => {
-  await Promise.all([loadPhotos(currentPage.value), loadInitialSettings()])
+  await Promise.all([loadPhotos(currentPage.value), loadInitialSettings(), loadCarouselStatus()])
   await updateBattery()
   batteryTimer = setInterval(updateBattery, 30000)
 })
@@ -345,10 +398,17 @@ onUnmounted(() => {
       :battery-level="batteryLevel"
       :photo-count="pagination.total_photos"
       :capture-busy="captureBusy"
+      :carousel-active="carouselActive"
+      :carousel-busy="carouselBusy"
       @refresh="loadPhotos(currentPage)"
       @capture="handleCapture"
+      @toggle-carousel="handleCarouselToggle"
       @settings="openSettings"
     />
+    <nav class="gallery-tabs" aria-label="Photo views">
+      <button class="tab-button" :class="{ active: !carouselOnly }" type="button" @click="changeView('all')">all photos</button>
+      <button class="tab-button" :class="{ active: carouselOnly }" type="button" @click="changeView('carousel')">carousel</button>
+    </nav>
     <PhotoGallery
       :photos="photos"
       :pagination="pagination"
@@ -367,6 +427,7 @@ onUnmounted(() => {
       :extension-actions="extensionActions"
       @close="closePreview"
       @notify="notify($event, 'success')"
+      @carousel-updated="handleCarouselUpdated"
     />
     <SettingsModal
       :open="settingsOpen"

@@ -6,6 +6,7 @@ import {
   ditheredDownloadUrl,
   generatePreview,
   runExtensionAction,
+  setCarouselPhoto,
 } from '../api/dashboardApi'
 
 const props = defineProps({
@@ -13,7 +14,7 @@ const props = defineProps({
   extensionActions: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['close', 'notify'])
+const emit = defineEmits(['close', 'notify', 'carousel-updated'])
 
 const dialogRef = ref(null)
 const tab = ref('dithered')
@@ -26,6 +27,8 @@ const sending = ref(false)
 const error = ref('')
 const rotation = ref(0)
 const extensionBusy = ref('')
+const carouselIncluded = ref(false)
+const carouselSaving = ref(false)
 const revision = ref(0)
 let requestController = null
 
@@ -68,6 +71,8 @@ function resetPreviewState(photo) {
   error.value = ''
   rotation.value = 0
   extensionBusy.value = ''
+  carouselIncluded.value = Boolean(photo.carousel_enabled)
+  carouselSaving.value = false
 }
 
 watch(
@@ -222,6 +227,24 @@ async function runExtension(action) {
   }
 }
 
+async function updateCarouselSelection(event) {
+  if (!props.photo || carouselSaving.value) return
+  const included = event.target.checked
+  carouselSaving.value = true
+  error.value = ''
+  try {
+    const result = await setCarouselPhoto(props.photo.id, included)
+    carouselIncluded.value = Boolean(result.included)
+    emit('carousel-updated', { id: props.photo.id, included: carouselIncluded.value })
+    emit('notify', carouselIncluded.value ? 'Photo added to carousel' : 'Photo removed from carousel')
+  } catch (selectionError) {
+    event.target.checked = carouselIncluded.value
+    error.value = selectionError.message || 'Could not save carousel selection'
+  } finally {
+    carouselSaving.value = false
+  }
+}
+
 onUnmounted(cancelPreviewRequest)
 </script>
 
@@ -229,6 +252,15 @@ onUnmounted(cancelPreviewRequest)
   <dialog ref="dialogRef" class="preview-dialog" aria-labelledby="preview-title" @close="handleClose">
     <div class="dialog-header">
       <h2 id="preview-title">{{ photo?.filename || photo?.id }}</h2>
+      <label class="carousel-toggle">
+        <input
+          type="checkbox"
+          :checked="carouselIncluded"
+          :disabled="!photo || carouselSaving"
+          @change="updateCarouselSelection"
+        />
+        include in carousel
+      </label>
       <button class="icon-button" type="button" aria-label="Close preview" @click="closeDialog">&times;</button>
     </div>
     <div class="preview-tabs" role="tablist" aria-label="Photo version" @keydown="handleTabKeydown">

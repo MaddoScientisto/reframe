@@ -7,6 +7,7 @@
   --panel: #fffdfc;
   --danger: #a52b25;
   --success: #236b48;
+  --carousel-gold: #bd8420;
   --shadow: 0 18px 50px rgba(24, 24, 24, 0.12);
   font-family: Georgia, 'Times New Roman', serif;
   color: var(--ink);
@@ -185,6 +186,12 @@ p {
   min-height: 320px;
 }
 
+.gallery-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 20px;
+}
+
 .photo-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -202,6 +209,10 @@ p {
 .photo-card:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 4px;
+}
+
+.photo-card.carousel-enabled {
+  border: 3px solid var(--carousel-gold);
 }
 
 .photo-frame {
@@ -350,6 +361,21 @@ select {
   margin: 0;
   font-size: 1.65rem;
   font-weight: 400;
+}
+
+.carousel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.carousel-toggle input {
+  width: 18px;
+  min-height: 18px;
+  accent-color: var(--carousel-gold);
 }
 
 .settings-grid {

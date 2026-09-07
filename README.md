@@ -65,7 +65,7 @@ reFrame is extremely minimalist by design. It has only a single button; no viewf
 4. Press the button again to take a new photo. It'll replace the previous one on the display.
 5. When you turn the camera off, the last photo will stay on the screen.
 
-A web dashboard, accessible over the local network, lets you browse photos, download originals, change the displayed image, adjust camera settings, and optionally upload dithered photos to Are.na.
+A web dashboard, accessible over the local network, lets you browse photos, download originals, change the displayed image, adjust camera settings, run a timed carousel of selected photos, and optionally upload dithered photos to Are.na. The carousel can use a Fisher-Yates shuffle at startup; changing membership while it runs updates the current queue without restarting it. The shutter button stops carousel mode before capturing a new photo.
 
 <img src="docs/images/reframe-dashboard.webp" alt="reFrame dashboard showing the photo gallery and camera controls" width="960" />
 

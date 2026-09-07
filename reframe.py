@@ -7,6 +7,7 @@ import subprocess
 import logging
 import socket
 import base64
+import random
 from io import BytesIO
 from time import sleep
 
@@ -273,7 +274,15 @@ class CameraManager:
         """Load camera settings from JSON file."""
         try:
             with open(self.settings_path, 'r') as f:
-                return json.load(f)
+                settings = json.load(f)
+            carousel = settings.get("carousel")
+            if not isinstance(carousel, dict):
+                carousel = {}
+                settings["carousel"] = carousel
+            carousel.setdefault("interval_seconds", 30)
+            carousel.setdefault("photo_ids", [])
+            carousel.setdefault("shuffle", False)
+            return settings
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logging.warning(f"Could not load settings from {self.settings_path}: {e}")
             # Return default settings
@@ -299,6 +308,11 @@ class CameraManager:
                     "display_timeout": 0,
                     "interrupt_refresh_on_capture": False,
                     "refresh_interrupt_action": "reset"
+                },
+                "carousel": {
+                    "interval_seconds": 30,
+                    "photo_ids": [],
+                    "shuffle": False
                 },
                 "system": {
                     "auto_refresh_interval": 30,
@@ -1761,6 +1775,13 @@ class CameraSystem:
         self.dashboard_qr_thread = None
         self._dashboard_qr_monitor_started = False
         self.dashboard_qr_running = False
+        self._carousel_lock = threading.Lock()
+        self._carousel_stop_event = None
+        self._carousel_thread = None
+        self._carousel_active = False
+        self._carousel_queue = []
+        self._carousel_current_photo_id = None
+        self._carousel_advance_event = threading.Event()
         logging.info("Timeout monitor initialization deferred for fast startup")
 
     def start_timeout_monitor(self):
@@ -1890,12 +1911,160 @@ class CameraSystem:
                 logging.warning(f"Dashboard QR monitor error: {e}")
             time.sleep(5)
 
+    def _carousel_photo_ids(self):
+        """Return selected photo IDs that still exist on disk."""
+        configured_ids = self.camera_manager.settings.get("carousel", {}).get("photo_ids", [])
+        return [photo_id for photo_id in configured_ids if self.file_manager.get_photo_info(photo_id)]
+
+    @staticmethod
+    def _shuffle_carousel_queue(photo_ids):
+        """Return a Fisher-Yates shuffle of the selected photo IDs."""
+        shuffled = list(photo_ids)
+        secure_random = random.SystemRandom()
+        for index in range(len(shuffled) - 1, 0, -1):
+            swap_index = secure_random.randrange(index + 1)
+            shuffled[index], shuffled[swap_index] = shuffled[swap_index], shuffled[index]
+        return shuffled
+
+    def _sync_carousel_queue(self):
+        """Apply membership changes without resetting the active sequence."""
+        selected_ids = self._carousel_photo_ids()
+        selected_set = set(selected_ids)
+        with self._carousel_lock:
+            if not self._carousel_active:
+                return
+
+            current_photo_id = self._carousel_current_photo_id
+            queue = [photo_id for photo_id in self._carousel_queue if photo_id in selected_set]
+            queued_ids = set(queue)
+            queue.extend(photo_id for photo_id in selected_ids if photo_id not in queued_ids)
+            self._carousel_queue = queue
+
+            if not queue:
+                self._carousel_active = False
+                if self._carousel_stop_event:
+                    self._carousel_stop_event.set()
+                self._carousel_advance_event.set()
+            elif current_photo_id and current_photo_id not in selected_set:
+                self._carousel_advance_event.set()
+
+    def carousel_status_api(self):
+        """Return the current carousel state and selected photo count."""
+        with self._carousel_lock:
+            active = self._carousel_active
+        carousel_settings = self.camera_manager.settings.get("carousel", {})
+        return {
+            "active": active,
+            "photo_count": len(self._carousel_photo_ids()),
+            "interval_seconds": carousel_settings.get("interval_seconds", 30)
+        }
+
+    def start_carousel(self):
+        """Start displaying the selected photos in a repeating sequence."""
+        photo_ids = self._carousel_photo_ids()
+        if not photo_ids:
+            return {
+                "success": False,
+                "error": "no_carousel_photos",
+                "message": "Select at least one photo for the carousel"
+            }
+
+        with self._carousel_lock:
+            if self._carousel_active:
+                return {"success": True, "active": True, "message": "Carousel is already running"}
+            carousel_settings = self.camera_manager.settings.get("carousel", {})
+            queue = (
+                self._shuffle_carousel_queue(photo_ids)
+                if carousel_settings.get("shuffle", False)
+                else list(photo_ids)
+            )
+            stop_event = threading.Event()
+            self._carousel_stop_event = stop_event
+            self._carousel_active = True
+            self._carousel_queue = queue
+            self._carousel_current_photo_id = None
+            self._carousel_advance_event.clear()
+            self._carousel_thread = threading.Thread(
+                target=self._carousel_loop,
+                args=(stop_event,),
+                daemon=True,
+                name="reframe-carousel"
+            )
+            self._carousel_thread.start()
+
+        self.update_activity()
+        return {"success": True, "active": True, "message": "Carousel started"}
+
+    def stop_carousel(self):
+        """Stop the carousel worker without interrupting the current display."""
+        with self._carousel_lock:
+            stop_event = self._carousel_stop_event
+            thread = self._carousel_thread
+            was_active = self._carousel_active
+            self._carousel_active = False
+            if stop_event:
+                stop_event.set()
+            self._carousel_advance_event.set()
+            self._carousel_queue = []
+            self._carousel_current_photo_id = None
+
+        if thread and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=0.1)
+        if was_active:
+            self.update_activity()
+        return {"success": True, "active": False, "message": "Carousel stopped"}
+
+    def _carousel_loop(self, stop_event):
+        try:
+            while not stop_event.is_set():
+                with self._carousel_lock:
+                    if not self._carousel_active or not self._carousel_queue:
+                        logging.info("Carousel stopped because no selected photos remain")
+                        return
+                    photo_id = self._carousel_queue[0]
+                    self._carousel_current_photo_id = photo_id
+                    self._carousel_advance_event.clear()
+
+                with _operation_lock:
+                    if stop_event.is_set():
+                        return
+                    self.update_activity()
+                    result = self.display_photo_api(photo_id)
+                if not result.get("success"):
+                    logging.warning("Carousel could not display %s: %s", photo_id, result.get("message"))
+
+                interval = self.camera_manager.settings.get("carousel", {}).get("interval_seconds", 30)
+                self._carousel_advance_event.wait(max(1, float(interval)))
+                if stop_event.is_set():
+                    return
+
+                with self._carousel_lock:
+                    if not self._carousel_active:
+                        return
+                    if self._carousel_current_photo_id == photo_id and photo_id in self._carousel_queue:
+                        self._carousel_queue.remove(photo_id)
+                        self._carousel_queue.append(photo_id)
+                    self._carousel_current_photo_id = None
+                    self._carousel_advance_event.clear()
+        except Exception as error:
+            logging.error("Carousel worker failed: %s", error)
+        finally:
+            with self._carousel_lock:
+                if self._carousel_stop_event is stop_event:
+                    self._carousel_active = False
+                    self._carousel_stop_event = None
+                    self._carousel_thread = None
+                    self._carousel_queue = []
+                    self._carousel_current_photo_id = None
+                    self._carousel_advance_event.clear()
+
     def capture_photo_api(self, fast_mode=False):
         """API-style photo capture with optimized display pipeline.
 
         Pipeline: capture to memory → dither+buffer → async display → background file save.
         This minimizes the delay between shutter press and the display starting to refresh.
         """
+        self.stop_carousel()
         try:
             photo_path = self.file_manager.get_new_file_path(SAVE_PATH, ORIGINAL_CAPTURE_EXTENSION)
             logging.info(f"Capturing photo to: {photo_path}")
@@ -2008,7 +2177,11 @@ class CameraSystem:
 
     def reload_settings_api(self):
         """API-style settings reload."""
-        return self.camera_manager.reload_settings()
+        was_active = self.carousel_status_api()["active"]
+        result = self.camera_manager.reload_settings()
+        if was_active:
+            self._sync_carousel_queue()
+        return result
 
     def apply_settings_api(self, camera_settings=None):
         """API-style settings application."""
@@ -2073,6 +2246,7 @@ def _create_fastapi_routes():
         global camera_system
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
+        camera_system.stop_carousel()
         display_settings = camera_system.camera_manager.settings.get("display", {})
         if (
             camera_system.eink_display.is_busy()
@@ -2083,6 +2257,32 @@ def _create_fastapi_routes():
             camera_system.update_activity()
             result = camera_system.capture_photo_api()
         return result
+
+    @app.get("/api/carousel/status")
+    def api_carousel_status():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        camera_system.update_activity()
+        return camera_system.carousel_status_api()
+
+    @app.post("/api/carousel/start")
+    def api_carousel_start():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        with _operation_lock:
+            result = camera_system.start_carousel()
+        if not result.get("success"):
+            raise HTTPException(status_code=409, detail=result.get("message", "Could not start carousel"))
+        return result
+
+    @app.post("/api/carousel/stop")
+    def api_carousel_stop():
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        return camera_system.stop_carousel()
 
     @app.post("/api/display/clear")
     def api_clear_display():
@@ -2422,6 +2622,7 @@ def main():
                     press_duration = time.monotonic() - button_press_start_time
 
                     if press_duration < LONG_PRESS_THRESHOLD:
+                        camera_system.stop_carousel()
                         # Block captures while display is mid-refresh to avoid
                         # invisible captures with no visual feedback
                         display_settings = camera_system.camera_manager.settings.get("display", {})

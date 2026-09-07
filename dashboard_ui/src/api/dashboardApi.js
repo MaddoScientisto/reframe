@@ -1,7 +1,8 @@
 import { jsonRequest, request, getPhotoFilename } from './http'
 
-export function getPhotos(page, limit) {
-  return request(`/api/photos?page=${page}&limit=${limit}`)
+export function getPhotos(page, limit, carouselOnly = false) {
+  const params = new URLSearchParams({ page, limit, carousel_only: carouselOnly })
+  return request(`/api/photos?${params.toString()}`)
 }
 
 export function getSettings() {
@@ -18,6 +19,22 @@ export function getExtensionActions() {
 
 export function capturePhoto() {
   return request('/api/capture', { method: 'POST' })
+}
+
+export function getCarouselStatus() {
+  return request('/api/carousel/status')
+}
+
+export function startCarousel() {
+  return request('/api/carousel/start', { method: 'POST' })
+}
+
+export function stopCarousel() {
+  return request('/api/carousel/stop', { method: 'POST' })
+}
+
+export function setCarouselPhoto(photoId, included) {
+  return jsonRequest(`/api/carousel/photos/${encodeURIComponent(photoId)}`, 'POST', { included })
 }
 
 export function displayPhoto(photoId) {

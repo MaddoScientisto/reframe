@@ -17,6 +17,7 @@ function actionKey(action) {
 <template>
   <article
     class="photo-card"
+    :class="{ 'carousel-enabled': photo.carousel_enabled }"
     tabindex="0"
     role="button"
     :aria-label="`Preview photo ${photo.id}`"

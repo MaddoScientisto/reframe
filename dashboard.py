@@ -97,6 +97,12 @@ def validate_settings(settings: Dict[str, Any]) -> None:
         if not allow_controls and any(ord(char) < 32 for char in value):
             raise SettingsValidationError(f"{path} cannot contain control characters")
 
+    def text_list(value: Any, path: str, maximum: int) -> None:
+        if not isinstance(value, list):
+            raise SettingsValidationError(f"{path} must be a list")
+        for index, item in enumerate(value):
+            text(item, f"{path}[{index}]", maximum)
+
     camera = section(settings, "camera", "camera")
     resolution = section(camera, "resolution", "camera.resolution")
     integer(resolution.get("width"), "camera.resolution.width", 100, 4000)
@@ -138,6 +144,11 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     boolean(display.get("interrupt_refresh_on_capture"), "display.interrupt_refresh_on_capture")
     if display.get("refresh_interrupt_action") not in {"reset", "stop"}:
         raise SettingsValidationError("display.refresh_interrupt_action must be reset or stop")
+
+    carousel = section(settings, "carousel", "carousel")
+    number(carousel.get("interval_seconds"), "carousel.interval_seconds", 1, 3600)
+    text_list(carousel.get("photo_ids"), "carousel.photo_ids", 200)
+    boolean(carousel.get("shuffle"), "carousel.shuffle")
 
     system = section(settings, "system", "system")
     integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
@@ -182,6 +193,11 @@ class SettingsManager:
                 "display_timeout": 0,
                 "interrupt_refresh_on_capture": False,
                 "refresh_interrupt_action": "reset"
+            },
+            "carousel": {
+                "interval_seconds": 30,
+                "photo_ids": [],
+                "shuffle": False
             },
             "system": {
                 "auto_refresh_interval": 30,
@@ -850,7 +866,7 @@ REFRAME_API_BASE = os.environ.get("REFRAME_API_BASE", "http://127.0.0.1:8077/api
 reframe_client = ReframeClient(REFRAME_API_BASE)
 
 @app.get("/api/photos")
-async def list_photos(page: int = 1, limit: int = 20):
+async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = False):
     """Get paginated list of photos with metadata from the hardware service."""
     if page < 1:
         page = 1
@@ -875,6 +891,12 @@ async def list_photos(page: int = 1, limit: int = 20):
     except Exception as e:
         logging.warning(f"Error fetching photos from hardware service: {e}")
         all_photos = []
+    carousel_ids = set(settings_manager.load_settings().get("carousel", {}).get("photo_ids", []))
+    for photo in all_photos:
+        photo["carousel_enabled"] = photo.get("id") in carousel_ids
+    if carousel_only:
+        all_photos = [photo for photo in all_photos if photo["carousel_enabled"]]
+
     start = (page - 1) * limit
     end = start + limit
     total = len(all_photos)
@@ -902,6 +924,9 @@ async def get_photo_info(photo_id: str):
             photo["original_path"] = f"/photos/{_bn(photo['original_path'])}"
         if photo.get("dithered_path"):
             photo["dithered_path"] = f"/dithered/{_bn(photo['dithered_path'])}"
+        photo["carousel_enabled"] = photo_id in set(
+            settings_manager.load_settings().get("carousel", {}).get("photo_ids", [])
+        )
         return photo
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -989,6 +1014,72 @@ async def update_settings(request: Request):
         )
 
     return {"status": "success", "message": "Settings updated successfully"}
+
+
+@app.get("/api/carousel/status")
+async def get_carousel_status():
+    """Get the current carousel state from the hardware service."""
+    try:
+        return await reframe_client.get("/carousel/status")
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Carousel service unavailable: {error}") from error
+
+
+@app.post("/api/carousel/start")
+async def start_carousel():
+    """Start cycling through the selected photos on the hardware display."""
+    try:
+        return await reframe_client.post("/carousel/start")
+    except httpx.HTTPStatusError as error:
+        detail = error.response.text or "Could not start carousel"
+        raise HTTPException(status_code=error.response.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Carousel service unavailable: {error}") from error
+
+
+@app.post("/api/carousel/stop")
+async def stop_carousel():
+    """Stop the hardware carousel."""
+    try:
+        return await reframe_client.post("/carousel/stop")
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Carousel service unavailable: {error}") from error
+
+
+@app.post("/api/carousel/photos/{photo_id}")
+async def update_carousel_photo(photo_id: str, request: Request):
+    """Persist whether one photo participates in the carousel."""
+    try:
+        body = await request.json()
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Carousel selection must be valid JSON") from error
+
+    included = body.get("included") if isinstance(body, dict) else None
+    if not isinstance(included, bool):
+        raise HTTPException(status_code=422, detail="included must be true or false")
+
+    previous_settings = settings_manager.load_settings()
+    carousel = previous_settings.setdefault("carousel", {})
+    photo_ids = list(carousel.get("photo_ids", []))
+    if included and photo_id not in photo_ids:
+        photo_ids.append(photo_id)
+    elif not included:
+        photo_ids = [value for value in photo_ids if value != photo_id]
+
+    try:
+        settings_manager.save_settings({"carousel": {"photo_ids": photo_ids}})
+        await reframe_client.post("/settings/reload")
+    except SettingsValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as apply_error:
+        try:
+            settings_manager.replace_settings(previous_settings)
+            await reframe_client.post("/settings/reload")
+        except Exception as rollback_error:
+            logging.error(f"Carousel selection rollback failed: {rollback_error}")
+        raise HTTPException(status_code=502, detail=f"Could not save carousel selection: {apply_error}") from apply_error
+
+    return {"status": "success", "photo_id": photo_id, "included": included}
 
 @app.get("/api/update/status")
 async def update_status():
