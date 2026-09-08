@@ -435,6 +435,41 @@ select {
   border-top: 1px solid var(--soft-line);
 }
 
+.download-progress-panel {
+  flex: 1 1 100%;
+  min-width: 0;
+  padding: 14px 0 2px;
+  border-bottom: 1px solid var(--soft-line);
+}
+
+.download-progress-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink);
+  font-size: 0.9rem;
+}
+
+.download-progress-bar {
+  display: block;
+  width: 100%;
+  height: 12px;
+  margin: 10px 0 8px;
+  accent-color: var(--success);
+}
+
+.download-progress-message,
+.download-progress-meta {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.download-progress-meta {
+  margin-bottom: 0;
+}
+
 .preview-dialog {
   width: min(880px, calc(100% - 24px));
   max-width: none;

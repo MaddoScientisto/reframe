@@ -81,8 +81,12 @@ class DashboardProxyHandler(BaseHTTPRequestHandler):
                 body,
                 headers,
             )
-            is_preview_stream = self.path.split("?", 1)[0] == "/api/preview/stream"
-            if is_preview_stream and response.status < 400:
+            request_path = self.path.split("?", 1)[0]
+            is_stream = request_path in {
+                "/api/preview/stream",
+                "/api/photos/download-all/result",
+            }
+            if is_stream and response.status < 400:
                 self._forward_stream(response, send_body)
                 return
 

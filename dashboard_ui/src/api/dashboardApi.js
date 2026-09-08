@@ -104,8 +104,8 @@ export function getDownloadProgress() {
   return request('/api/photos/download-all/progress')
 }
 
-export function abortDownload() {
-  return request('/api/photos/download-all/abort', { method: 'POST' })
+export function abortDownload(options = {}) {
+  return request('/api/photos/download-all/abort', { method: 'POST', ...options })
 }
 
 export function startDelete() {

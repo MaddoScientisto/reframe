@@ -100,7 +100,9 @@ const showGameBoyPalette = computed(() => method.value === 'gb-default-color')
 const dirty = computed(() => initialSnapshot.value !== currentSnapshot())
 const downloadPercent = computed(() => {
   const job = props.downloadState || {}
-  return job.total ? Math.round((job.processed / job.total) * 100) : 0
+  if (job.status === 'completed') return 100
+  if (!job.total) return 0
+  return Math.min(100, Math.max(0, Math.round((job.processed / job.total) * 100)))
 })
 const deletePercent = computed(() => {
   const job = props.deleteState || {}
@@ -160,8 +162,18 @@ function clearArenaToken() {
 
 function formatJobMessage(job, percent) {
   if (!job || job.status === 'idle') return ''
-  if (job.status === 'running' || job.status === 'starting') return `${job.message || 'working...'} ${percent}%`
+  if (['running', 'starting', 'preparing', 'creating', 'aborting'].includes(job.status)) {
+    return `${job.message || 'working...'} ${percent}%`
+  }
   return job.message || ''
+}
+
+function isDownloadActive(status) {
+  return ['starting', 'running', 'preparing', 'creating', 'aborting', 'downloading'].includes(status)
+}
+
+function isDownloadBuilding(status) {
+  return ['starting', 'running', 'preparing', 'creating', 'aborting'].includes(status)
 }
 </script>
 
@@ -293,15 +305,28 @@ function formatJobMessage(job, percent) {
       </form>
 
       <footer class="settings-footer">
+        <div v-if="downloadState.status !== 'idle'" class="download-progress-panel" role="status" aria-live="polite">
+          <div class="download-progress-heading">
+            <strong>photo download</strong>
+            <span v-if="isDownloadBuilding(downloadState.status)">{{ downloadPercent }}%</span>
+          </div>
+          <progress class="download-progress-bar" :value="downloadPercent" max="100" aria-label="Photo download progress"></progress>
+          <p class="download-progress-message">{{ downloadState.message || 'Preparing photo download...' }}</p>
+          <p v-if="downloadState.total" class="download-progress-meta">
+            {{ downloadState.processed }} of {{ downloadState.total }} photos processed
+            <span v-if="downloadState.files_added"> - {{ downloadState.files_added }} files added</span>
+            <span v-if="downloadState.files_skipped"> - {{ downloadState.files_skipped }} skipped</span>
+          </p>
+        </div>
         <div class="button-row wrap-row">
           <button class="button" type="button" :disabled="saving" @click="save">{{ saving ? 'saving...' : 'save settings' }}</button>
           <button class="button button-light" type="button" @click="resetSettings">reset to defaults</button>
         </div>
         <div class="button-row wrap-row">
-          <button class="button button-light" type="button" :disabled="['starting', 'running'].includes(downloadState.status)" @click="$emit('download-all')">
+          <button class="button button-light" type="button" :disabled="isDownloadActive(downloadState.status)" @click="$emit('download-all')">
             {{ formatJobMessage(downloadState, downloadPercent) || 'download all photos' }}
           </button>
-          <button v-if="['starting', 'running'].includes(downloadState.status)" class="button danger" type="button" @click="$emit('abort-download')">abort download</button>
+          <button v-if="['starting', 'running', 'preparing', 'creating'].includes(downloadState.status)" class="button danger" type="button" @click="$emit('abort-download')">abort download</button>
           <button class="button danger" type="button" :disabled="['starting', 'running'].includes(deleteState.status)" @click="$emit('delete-all')">
             {{ formatJobMessage(deleteState, deletePercent) || 'delete all photos' }}
           </button>

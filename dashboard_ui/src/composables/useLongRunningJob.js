@@ -10,6 +10,7 @@ export function useLongRunningJob({ start, getProgress, abort, label, maxAttempt
   })
   let timer = null
   let attempts = 0
+  const terminalStatuses = ['completed', 'aborted', 'error', 'idle']
 
   function clearTimer() {
     if (timer) {
@@ -26,7 +27,7 @@ export function useLongRunningJob({ start, getProgress, abort, label, maxAttempt
     try {
       const progress = await getProgress()
       setState(progress)
-      if (['completed', 'aborted', 'error', 'idle'].includes(progress.status)) return
+      if (terminalStatuses.includes(progress.status)) return
       attempts += 1
       if (attempts >= maxAttempts) {
         setState({ status: 'error', message: `${label} timed out` })
@@ -44,7 +45,7 @@ export function useLongRunningJob({ start, getProgress, abort, label, maxAttempt
     setState({ status: 'starting', processed: 0, total: 0, message: `starting ${label}...` })
     try {
       const result = await start()
-      if (result.status === 'completed') {
+      if (terminalStatuses.includes(result.status)) {
         setState(result)
         return result
       }
@@ -57,11 +58,26 @@ export function useLongRunningJob({ start, getProgress, abort, label, maxAttempt
     }
   }
 
+  async function syncJob() {
+    clearTimer()
+    attempts = 0
+    try {
+      const progress = await getProgress()
+      setState(progress)
+      if (!terminalStatuses.includes(progress.status)) timer = setTimeout(poll, 1000)
+      return progress
+    } catch (error) {
+      setState({ status: 'error', message: error.message || `${label} failed` })
+      return null
+    }
+  }
+
   async function abortJob() {
     clearTimer()
     try {
       const result = await abort()
       setState(result)
+      if (!terminalStatuses.includes(result.status)) await poll()
       return result
     } catch (error) {
       setState({ status: 'error', message: error.message || `could not abort ${label}` })
@@ -76,5 +92,5 @@ export function useLongRunningJob({ start, getProgress, abort, label, maxAttempt
 
   onUnmounted(clearTimer)
 
-  return { state, startJob, abortJob, reset, clearTimer }
+  return { state, startJob, syncJob, abortJob, reset, clearTimer }
 }

@@ -1509,7 +1509,14 @@ async def reprocess_single_photo(photo_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to reprocess photo: {str(e)}")
 
 # Global variable to track download progress
-download_progress = {"status": "idle", "processed": 0, "total": 0, "message": ""}
+download_progress = {
+    "status": "idle",
+    "processed": 0,
+    "total": 0,
+    "files_added": 0,
+    "files_skipped": 0,
+    "message": "",
+}
 download_abort = False
 download_job_active = False
 
@@ -1522,33 +1529,52 @@ async def start_download_all(background_tasks: BackgroundTasks):
     """Start the download process and return immediately."""
     global download_progress, download_job_active
     
-    if download_job_active or download_progress.get("status") in {"preparing", "creating", "completed", "downloading"}:
-        raise HTTPException(status_code=409, detail="A photo download is already in progress")
+    if download_job_active or download_progress.get("status") in {"preparing", "creating", "aborting", "completed", "downloading"}:
+        status = download_progress.get("status", "unknown")
+        if status == "completed":
+            detail = "A ZIP is ready. Use the download button to retrieve it."
+        else:
+            detail = f"A photo download is already in progress ({status}). Check its progress or abort it."
+        raise HTTPException(status_code=409, detail=detail)
+
+    global download_abort
+    download_abort = False
+    download_job_active = True
+    download_progress = {
+        "status": "preparing",
+        "processed": 0,
+        "total": 0,
+        "files_added": 0,
+        "files_skipped": 0,
+        "message": "Preparing download...",
+    }
 
     try:
         # Get all photos from hardware service
         all_photos = await reframe_client.get("/photos")
+
+        if download_abort:
+            download_job_active = False
+            download_progress["status"] = "aborted"
+            download_progress["message"] = "Download aborted by user"
+            return {"status": "aborted", "message": "Download aborted"}
         
         if not all_photos:
             raise HTTPException(status_code=404, detail="No photos found")
         
         # Initialize progress
-        global download_abort
-        download_abort = False
-        download_job_active = True
-        download_progress = {
-            "status": "preparing",
-            "processed": 0,
-            "total": len(all_photos),
-            "message": "Preparing download..."
-        }
+        download_progress["total"] = len(all_photos)
         
         # Start background task
         background_tasks.add_task(create_zip_background, all_photos)
         
         return {"status": "started", "total_photos": len(all_photos)}
         
-    except HTTPException:
+    except HTTPException as error:
+        download_job_active = False
+        if download_progress.get("status") not in {"aborted", "aborting"}:
+            download_progress["status"] = "error"
+            download_progress["message"] = error.detail
         raise
     except Exception as e:
         download_job_active = False
@@ -1564,7 +1590,8 @@ async def get_download_progress():
 @app.post("/api/photos/download-all/abort")
 async def abort_download():
     """Abort the current download process."""
-    global download_abort, download_progress
+    global download_abort, download_progress, download_job_active
+    was_active = download_job_active
     download_abort = True
     zip_path = download_progress.get("zip_path")
     if download_progress.get("status") == "completed" and zip_path:
@@ -1573,12 +1600,17 @@ async def abort_download():
         except FileNotFoundError:
             pass
     download_progress = {
-        "status": "aborted",
+        "status": "aborting" if was_active else "aborted",
         "processed": download_progress.get("processed", 0),
         "total": download_progress.get("total", 0),
-        "message": "Download aborted by user"
+        "files_added": download_progress.get("files_added", 0),
+        "files_skipped": download_progress.get("files_skipped", 0),
+        "message": "Stopping download..." if was_active else "Download aborted by user"
     }
-    return {"status": "aborted", "message": "Download aborted"}
+    return {
+        "status": download_progress["status"],
+        "message": download_progress["message"],
+    }
 
 @app.get("/api/photos/download-all/result")
 async def get_download_result():
@@ -1631,30 +1663,60 @@ def create_zip_file(all_photos, temp_path):
 
     download_progress["status"] = "creating"
     download_progress["message"] = "Creating ZIP file..."
+    download_progress["files_added"] = 0
+    download_progress["files_skipped"] = 0
     total_photos = len(all_photos)
+
+    def resolve_photo_path(raw_path, base_path):
+        if not raw_path:
+            return None
+
+        candidate = Path(str(raw_path))
+        if candidate.is_file():
+            return candidate
+
+        fallback = Path(base_path) / candidate.name
+        return fallback if fallback.is_file() else None
 
     with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
         for processed, photo in enumerate(all_photos, start=1):
             if download_abort:
                 return False
 
-            try:
-                original_path = photo.get("original_path")
-                if original_path and os.path.exists(original_path):
-                    zip_file.write(original_path, f"original/{os.path.basename(original_path)}")
+            for folder, raw_path, base_path in (
+                ("original", photo.get("original_path"), PHOTOS_PATH),
+                ("dithered", photo.get("dithered_path"), DITHERED_PHOTOS_PATH),
+            ):
+                if not raw_path:
+                    continue
 
-                dithered_path = photo.get("dithered_path")
-                if dithered_path and os.path.exists(dithered_path):
-                    zip_file.write(dithered_path, f"dithered/{os.path.basename(dithered_path)}")
-            except Exception as e:
-                print(f"Error adding photo {photo.get('id', 'unknown')} to ZIP: {e}")
+                photo_path = resolve_photo_path(raw_path, base_path)
+                if photo_path is None:
+                    download_progress["files_skipped"] += 1
+                    continue
+
+                try:
+                    zip_file.write(photo_path, f"{folder}/{photo_path.name}")
+                    download_progress["files_added"] += 1
+                except Exception as error:
+                    download_progress["files_skipped"] += 1
+                    logging.warning(
+                        "Could not add %s to ZIP: %s",
+                        photo_path,
+                        error,
+                    )
 
             if download_abort:
                 return False
             download_progress["processed"] = processed
-            download_progress["message"] = f"Processing photo {processed}/{total_photos}"
+            skipped = download_progress["files_skipped"]
+            skipped_message = f", skipped {skipped}" if skipped else ""
+            download_progress["message"] = (
+                f"Processing photo {processed}/{total_photos} "
+                f"({download_progress['files_added']} files{skipped_message})"
+            )
 
-    return not download_abort
+    return not download_abort and download_progress["files_added"] > 0
 
 
 def expire_download_archive(zip_path):
@@ -1685,13 +1747,22 @@ async def create_zip_background(all_photos):
 
         completed = await asyncio.to_thread(create_zip_file, all_photos, temp_path)
         if not completed:
-            download_progress["status"] = "aborted"
-            download_progress["message"] = "Download aborted by user"
+            if download_abort:
+                download_progress["status"] = "aborted"
+                download_progress["message"] = "Download aborted by user"
+            else:
+                download_progress["status"] = "error"
+                download_progress["message"] = "No readable photo files were found"
             return
 
         archive_size = os.path.getsize(temp_path)
         download_progress["status"] = "completed"
-        download_progress["message"] = "ZIP file ready for download"
+        skipped = download_progress.get("files_skipped", 0)
+        skipped_message = f"; skipped {skipped} missing files" if skipped else ""
+        download_progress["message"] = (
+            f"ZIP ready: {download_progress.get('files_added', 0)} files"
+            f"{skipped_message}"
+        )
         download_progress["zip_path"] = temp_path
         download_progress["size_bytes"] = archive_size
         keep_archive = True

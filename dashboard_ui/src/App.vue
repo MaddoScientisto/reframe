@@ -56,6 +56,7 @@ const settingsSaving = ref(false)
 const displayState = ref('')
 const updateState = ref({ busy: false, can_update: false, message: '' })
 const notification = ref(null)
+const downloadWasRequested = ref(false)
 let notificationTimer = null
 let batteryTimer = null
 let refreshTimer = null
@@ -347,17 +348,28 @@ function triggerZipDownload() {
   const link = document.createElement('a')
   link.href = '/api/photos/download-all/result'
   link.download = `reframe-photos-${new Date().toISOString().slice(0, 10)}.zip`
+  link.style.display = 'none'
+  document.body.appendChild(link)
   link.click()
-  notify('ZIP download sent to browser', 'success')
-  setTimeout(() => downloadJob.reset(), 2500)
+  link.remove()
+  downloadWasRequested.value = false
+  notify('ZIP download started. The archive is being sent to your browser.', 'success')
+  setTimeout(() => downloadJob.reset(), 5000)
 }
 
 async function handleDownloadAll() {
   await notifyUserActivity()
+  await downloadJob.syncJob()
+  const currentStatus = downloadJob.state.value.status
+  if (['starting', 'running', 'preparing', 'creating', 'aborting'].includes(currentStatus)) {
+    notify('Photo download is already in progress. Watch the progress below.', 'info')
+    return
+  }
   if (downloadJob.state.value.status === 'completed') {
     triggerZipDownload()
     return
   }
+  downloadWasRequested.value = true
   await downloadJob.startJob()
 }
 
@@ -377,7 +389,9 @@ async function handleAbortDelete() {
 }
 
 watch(() => downloadJob.state.value.status, (status) => {
-  if (status === 'completed') triggerZipDownload()
+  if (status === 'completed' && downloadWasRequested.value) triggerZipDownload()
+  if (status === 'error') notify(downloadJob.state.value.message || 'Photo download failed', 'error')
+  if (status === 'aborted') notify(downloadJob.state.value.message || 'Photo download aborted', 'info')
 })
 
 watch(() => deleteJob.state.value.status, async (status) => {
@@ -389,10 +403,23 @@ watch(() => deleteJob.state.value.status, async (status) => {
 })
 
 onMounted(async () => {
+  window.addEventListener('pagehide', handlePageHide)
   await Promise.all([loadPhotos(currentPage.value), loadInitialSettings(), loadCarouselStatus()])
+  const downloadProgress = await downloadJob.syncJob()
+  if (['preparing', 'creating', 'running', 'aborting'].includes(downloadProgress?.status)) {
+    notify('A photo download is already running. Its progress has been restored.', 'info')
+  } else if (downloadProgress?.status === 'completed') {
+    notify('ZIP is ready. Open settings to download it.', 'success')
+  }
   await updateBattery()
   batteryTimer = setInterval(updateBattery, 30000)
 })
+
+function handlePageHide() {
+  if (!['starting', 'running', 'preparing', 'creating'].includes(downloadJob.state.value.status)) return
+  downloadJob.clearTimer()
+  abortDownload({ keepalive: true }).catch(() => {})
+}
 
 async function updateBattery() {
   try {
@@ -404,6 +431,7 @@ async function updateBattery() {
 }
 
 onUnmounted(() => {
+  window.removeEventListener('pagehide', handlePageHide)
   clearInterval(batteryTimer)
   clearInterval(refreshTimer)
   clearTimeout(notificationTimer)

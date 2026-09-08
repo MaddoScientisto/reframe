@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -139,6 +140,64 @@ class DitheredExportTests(unittest.TestCase):
         self.assertIsNotNone(fake_client.upload_content)
         with Image.open(BytesIO(fake_client.upload_content)) as image:
             self.assertEqual(image.size, (4, 4))
+
+    def test_zip_resolves_dashboard_paths_and_reports_missing_files(self):
+        zip_path = Path(self.temp_dir.name) / "photos.zip"
+        progress = {
+            "status": "idle",
+            "processed": 0,
+            "total": 2,
+            "files_added": 0,
+            "files_skipped": 0,
+            "message": "",
+        }
+        photos = [
+            {
+                "id": "available",
+                "original_path": f"/photos/{self.image_path.name}",
+                "dithered_path": f"/dithered/{self.image_path.name}",
+            },
+            {
+                "id": "missing",
+                "original_path": "/photos/missing.png",
+                "dithered_path": None,
+            },
+        ]
+
+        with patch.object(dashboard, "PHOTOS_PATH", self.temp_dir.name), patch.object(
+            dashboard, "DITHERED_PHOTOS_PATH", self.temp_dir.name
+        ), patch.object(dashboard, "download_progress", progress), patch.object(
+            dashboard, "download_abort", False
+        ):
+            completed = dashboard.create_zip_file(photos, str(zip_path))
+
+        self.assertTrue(completed)
+        self.assertEqual(progress["processed"], 2)
+        self.assertEqual(progress["files_added"], 2)
+        self.assertEqual(progress["files_skipped"], 1)
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {f"original/{self.image_path.name}", f"dithered/{self.image_path.name}"},
+            )
+
+    def test_abort_active_download_reports_stopping_state(self):
+        progress = {
+            "status": "creating",
+            "processed": 1,
+            "total": 2,
+            "files_added": 2,
+            "files_skipped": 0,
+            "message": "Processing photo 1/2",
+        }
+
+        with patch.object(dashboard, "download_progress", progress), patch.object(
+            dashboard, "download_job_active", True
+        ), patch.object(dashboard, "download_abort", False):
+            result = asyncio.run(dashboard.abort_download())
+
+        self.assertEqual(result["status"], "aborting")
+        self.assertEqual(result["message"], "Stopping download...")
 
 
 if __name__ == "__main__":
