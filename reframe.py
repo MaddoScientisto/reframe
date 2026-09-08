@@ -206,6 +206,18 @@ class PreviewSessionBusy(RuntimeError):
     pass
 
 
+class PreviewSessionAccessDenied(RuntimeError):
+    pass
+
+
+class FocusOperationBusy(RuntimeError):
+    pass
+
+
+class FocusOperationError(RuntimeError):
+    pass
+
+
 class CameraPreviewSession:
     """Keep one encoded preview frame available for a single HTTP client."""
 
@@ -218,12 +230,19 @@ class CameraPreviewSession:
         self._active = False
         self._sequence = 0
         self._latest_frame = None
+        self._frame_times = []
+        self._started_monotonic = None
 
     def start(self):
         with self._condition:
             if self._active:
                 raise PreviewSessionBusy("Live preview is already in use")
             self._active = True
+            self._started_monotonic = time.monotonic()
+            self._frame_times = []
+            self._latest_frame = None
+            self._sequence = 0
+            self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._run,
                 name="camera-preview",
@@ -262,15 +281,19 @@ class CameraPreviewSession:
             while not self._stop_event.is_set():
                 frame_started = time.monotonic()
                 try:
-                    jpeg = self.camera_manager.capture_preview_jpeg()
+                    capture_frame = getattr(self.camera_manager, "capture_preview_frame", None)
+                    frame = capture_frame() if capture_frame else self.camera_manager.capture_preview_jpeg()
                 except Exception:
                     logging.exception("Live preview capture failed")
                     break
 
-                if jpeg is not None:
+                if frame is not None:
                     with self._condition:
-                        self._latest_frame = jpeg
+                        self._latest_frame = frame
                         self._sequence += 1
+                        self._frame_times.append(time.monotonic())
+                        if len(self._frame_times) > 30:
+                            self._frame_times.pop(0)
                         self._condition.notify_all()
 
                 next_deadline += interval
@@ -283,6 +306,36 @@ class CameraPreviewSession:
             with self._condition:
                 self._active = False
                 self._condition.notify_all()
+
+    def get_frame_telemetry(self):
+        with self._condition:
+            frame = self._latest_frame
+            sequence = self._sequence
+            frame_times = list(self._frame_times)
+
+        if frame is None:
+            return {
+                "sequence": sequence,
+                "frame": None,
+                "age_seconds": None,
+                "frame_rate": None,
+            }
+
+        captured_at = frame.get("captured_at") if isinstance(frame, dict) else None
+        age_seconds = None
+        if captured_at is not None:
+            age_seconds = max(0.0, time.monotonic() - captured_at)
+
+        frame_rate = None
+        if len(frame_times) >= 2 and frame_times[-1] > frame_times[0]:
+            frame_rate = (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
+
+        return {
+            "sequence": sequence,
+            "frame": frame,
+            "age_seconds": age_seconds,
+            "frame_rate": frame_rate,
+        }
 
 
 def get_lan_ip_address():
@@ -411,6 +464,9 @@ class CameraManager:
         self.settings = self.load_settings()
         self.picam2 = Picamera2()
         self._camera_lock = threading.Lock()
+        self._focus_lock = threading.Lock()
+        self._focus_mode = self.settings.get("camera", {}).get("autofocus_mode", 2)
+        self._manual_focus_position = None
         self._preview_session_lock = threading.Lock()
         self._preview_session = None
         self.last_activity_monotonic = time.monotonic()
@@ -496,6 +552,7 @@ class CameraManager:
             controls["Sharpness"] = camera_settings["sharpness"]
         if "autofocus_mode" in camera_settings:
             controls["AfMode"] = camera_settings["autofocus_mode"]
+            self._focus_mode = camera_settings["autofocus_mode"]
 
         with self._camera_lock:
             for control_name, control_value in controls.items():
@@ -605,6 +662,7 @@ class CameraManager:
             try:
                 af_mode = camera_settings.get("autofocus_mode", 2)
                 self.picam2.set_controls({"AfMode": af_mode})
+                self._focus_mode = af_mode
             except Exception as e:
                 logging.warning(f"Could not set autofocus mode: {e}")
 
@@ -651,13 +709,22 @@ class CameraManager:
         if session is not None:
             session.stop()
 
-    def capture_preview_jpeg(self):
-        """Capture and encode one lores frame, or skip a busy camera cycle."""
+    def capture_preview_frame(self):
+        """Capture one lores frame and its metadata from the same request."""
         if not self._camera_lock.acquire(blocking=False):
             return None
         try:
-            frame = self.picam2.capture_array("lores")
-            frame = _lazy_import_numpy().array(frame, copy=True)
+            metadata = {}
+            if hasattr(self.picam2, "capture_request"):
+                request = self.picam2.capture_request()
+                try:
+                    frame = _lazy_import_numpy().array(request.make_array("lores"), copy=True)
+                    metadata = dict(request.get_metadata() or {})
+                finally:
+                    request.release()
+            else:
+                frame = self.picam2.capture_array("lores")
+                frame = _lazy_import_numpy().array(frame, copy=True)
         finally:
             self._camera_lock.release()
 
@@ -665,7 +732,268 @@ class CameraManager:
         image = yuv420_to_image(frame, self.preview_size)
         output = BytesIO()
         image.save(output, format="JPEG", quality=LIVE_PREVIEW_JPEG_QUALITY)
-        return output.getvalue()
+        return {
+            "jpeg": output.getvalue(),
+            "metadata": metadata,
+            "captured_at": time.monotonic(),
+        }
+
+    def capture_preview_jpeg(self):
+        """Capture and encode one lores frame, or skip a busy camera cycle."""
+        frame = self.capture_preview_frame()
+        return frame["jpeg"] if frame is not None else None
+
+    def _preview_session_for_owner(self, owner_id):
+        with self._preview_session_lock:
+            session = self._preview_session
+            if (
+                session is None
+                or not session.is_active()
+                or session.owner_id != owner_id
+            ):
+                raise PreviewSessionAccessDenied("Preview client is not active")
+            return session
+
+    @staticmethod
+    def _metadata_number(metadata, key):
+        value = metadata.get(key)
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        return int(number) if number.is_integer() and isinstance(value, int) else number
+
+    @staticmethod
+    def _focus_mode_name(mode):
+        return {0: "manual", 1: "auto", 2: "continuous"}.get(mode)
+
+    @staticmethod
+    def _focus_state_name(state):
+        return {0: "idle", 1: "scanning", 2: "focused", 3: "failed"}.get(state)
+
+    def get_focus_range(self):
+        """Return the lens control range reported by Picamera2."""
+        controls = getattr(self.picam2, "camera_controls", {}) or {}
+        control = controls.get("LensPosition")
+        if isinstance(control, dict):
+            minimum = control.get("min")
+            maximum = control.get("max")
+            step = control.get("step")
+        elif isinstance(control, (tuple, list)) and len(control) >= 2:
+            minimum, maximum = control[:2]
+            step = control[3] if len(control) >= 4 else None
+        else:
+            return None
+
+        minimum = self._metadata_number({"value": minimum}, "value")
+        maximum = self._metadata_number({"value": maximum}, "value")
+        step = self._metadata_number({"value": step}, "value") if step is not None else None
+        if minimum is None or maximum is None or maximum <= minimum:
+            return None
+        if step is None or step <= 0:
+            step = round((maximum - minimum) / 100, 3)
+        return {"min": minimum, "max": maximum, "step": step}
+
+    def get_preview_telemetry(self, owner_id):
+        session = self._preview_session_for_owner(owner_id)
+        frame_info = session.get_frame_telemetry()
+        frame = frame_info["frame"]
+        metadata = frame.get("metadata", {}) if isinstance(frame, dict) else {}
+        focus_mode = metadata.get("AfMode", self._focus_mode)
+        focus_state = metadata.get("AfState")
+        try:
+            focus_mode = int(focus_mode)
+        except (TypeError, ValueError):
+            focus_mode = self._focus_mode
+        try:
+            focus_state = int(focus_state) if focus_state is not None else None
+        except (TypeError, ValueError):
+            focus_state = None
+
+        telemetry = {
+            "success": True,
+            "frame_sequence": frame_info["sequence"],
+            "frame_age_seconds": (
+                round(frame_info["age_seconds"], 3)
+                if frame_info["age_seconds"] is not None else None
+            ),
+            "frame_rate": (
+                round(frame_info["frame_rate"], 2)
+                if frame_info["frame_rate"] is not None else None
+            ),
+            "focus_mode": self._focus_mode_name(focus_mode),
+            "focus_mode_value": focus_mode,
+            "focus_state": self._focus_state_name(focus_state),
+            "focus_state_value": focus_state,
+            "lens_position": self._metadata_number(metadata, "LensPosition"),
+            "focus_range": self.get_focus_range(),
+            "exposure_value": self._metadata_number(
+                self.settings.get("camera", {}), "exposure_value"
+            ),
+        }
+
+        metadata_fields = {
+            "exposure_time_us": "ExposureTime",
+            "analogue_gain": "AnalogueGain",
+            "colour_temperature": "ColourTemperature",
+            "lux": "Lux",
+        }
+        for output_key, metadata_key in metadata_fields.items():
+            if metadata_key in metadata:
+                telemetry[output_key] = self._metadata_number(metadata, metadata_key)
+        return telemetry
+
+    def _acquire_focus_lock(self):
+        if not self._focus_lock.acquire(blocking=False):
+            raise FocusOperationBusy("Focus or capture operation is already in progress")
+
+    def set_focus_mode(self, mode):
+        if mode not in {0, 1, 2}:
+            raise FocusOperationError("Focus mode must be manual, auto, or continuous")
+        self._acquire_focus_lock()
+        try:
+            with self._camera_lock:
+                self.picam2.set_controls({"AfMode": mode})
+            self._focus_mode = mode
+            self.settings.setdefault("camera", {})["autofocus_mode"] = mode
+            return {
+                "success": True,
+                "focus_mode": self._focus_mode_name(mode),
+                "focus_mode_value": mode,
+                "message": f"Focus mode set to {self._focus_mode_name(mode)}",
+            }
+        except Exception as error:
+            raise FocusOperationError(f"Could not set focus mode: {error}") from error
+        finally:
+            self._focus_lock.release()
+
+    def set_focus_position(self, position):
+        if not isinstance(position, (int, float)) or isinstance(position, bool):
+            raise FocusOperationError("Lens position must be a number")
+        focus_range = self.get_focus_range()
+        if focus_range is None:
+            raise FocusOperationError("Lens position range is unavailable")
+        if position < focus_range["min"] or position > focus_range["max"]:
+            raise FocusOperationError(
+                f"Lens position must be between {focus_range['min']} and {focus_range['max']}"
+            )
+        self._acquire_focus_lock()
+        try:
+            if self._focus_mode != 0:
+                raise FocusOperationError("Lens position is available only in manual focus mode")
+            with self._camera_lock:
+                self.picam2.set_controls({"LensPosition": position})
+            self._manual_focus_position = position
+            return {
+                "success": True,
+                "focus_mode": "manual",
+                "focus_mode_value": 0,
+                "lens_position": position,
+                "message": "Manual focus position updated",
+            }
+        finally:
+            self._focus_lock.release()
+
+    def _sensor_size(self):
+        properties = getattr(self.picam2, "camera_properties", {}) or {}
+        size = properties.get("PixelArraySize")
+        if not size:
+            size = getattr(self.picam2, "sensor_resolution", None)
+        if not size:
+            resolution = self.settings.get("camera", {}).get("resolution", {})
+            size = (resolution.get("width", 1200), resolution.get("height", 800))
+        return int(size[0]), int(size[1])
+
+    def _center_focus_window(self):
+        width, height = self._sensor_size()
+        window_width = max(2, width // 4)
+        window_height = max(2, height // 4)
+        left = (width - window_width) // 2
+        top = (height - window_height) // 2
+        return (left, top, window_width, window_height)
+
+    def _capture_focus_metadata(self):
+        if not hasattr(self.picam2, "capture_metadata"):
+            return {"AfState": 2, "LensPosition": self._manual_focus_position or 0.0}
+        with self._camera_lock:
+            return dict(self.picam2.capture_metadata() or {})
+
+    def _wait_for_focus(self, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            metadata = self._capture_focus_metadata()
+            state = metadata.get("AfState")
+            try:
+                state = int(state)
+            except (TypeError, ValueError):
+                state = None
+            if state in {2, 3}:
+                return metadata
+            time.sleep(0.05)
+        raise FocusOperationError("Center focus timed out")
+
+    def focus_center(self):
+        self._acquire_focus_lock()
+        previous_mode = self._focus_mode
+        previous_position = self._manual_focus_position
+        try:
+            window_controls = {
+                "AfWindows": [self._center_focus_window()],
+                "AfMetering": 1,
+                "AfMode": 1,
+                "AfTrigger": 0,
+            }
+            with self._camera_lock:
+                self.picam2.set_controls(window_controls)
+
+            metadata = self._wait_for_focus()
+            state = metadata.get("AfState")
+            try:
+                state = int(state)
+            except (TypeError, ValueError):
+                state = None
+            if state != 2:
+                raise FocusOperationError("Center focus failed")
+
+            position = self._metadata_number(metadata, "LensPosition")
+            if previous_mode == 0:
+                if position is None:
+                    raise FocusOperationError("Center focus did not return a lens position")
+                with self._camera_lock:
+                    self.picam2.set_controls({"AfMode": 0, "LensPosition": position})
+                self._manual_focus_position = position
+            elif previous_mode == 2:
+                with self._camera_lock:
+                    self.picam2.set_controls({"AfMode": 2})
+
+            self._focus_mode = previous_mode
+            return {
+                "success": True,
+                "focus_mode": self._focus_mode_name(previous_mode),
+                "focus_mode_value": previous_mode,
+                "focus_state": "focused",
+                "lens_position": position,
+                "message": "Center focus complete",
+            }
+        except Exception as error:
+            try:
+                restore = {"AfMode": previous_mode}
+                if previous_mode == 0 and previous_position is not None:
+                    restore["LensPosition"] = previous_position
+                with self._camera_lock:
+                    self.picam2.set_controls(restore)
+                self._focus_mode = previous_mode
+            except Exception as restore_error:
+                logging.error("Could not restore focus mode after center focus: %s", restore_error)
+            if isinstance(error, FocusOperationError):
+                raise
+            raise FocusOperationError(f"Could not focus center: {error}") from error
+        finally:
+            self._focus_lock.release()
 
     def update_activity_time(self):
         """Update the last activity timestamp."""
@@ -709,18 +1037,26 @@ class CameraManager:
 
     def capture_photo(self, file_path, fast_mode=False):
         """Capture a photo and save it to the specified file path."""
-        self._settle_autofocus(fast_mode)
-        with self._camera_lock:
-            self.picam2.capture_file(file_path)
-        logging.info(f"Photo saved to {file_path}")
+        self._acquire_focus_lock()
+        try:
+            self._settle_autofocus(fast_mode)
+            with self._camera_lock:
+                self.picam2.capture_file(file_path)
+            logging.info(f"Photo saved to {file_path}")
+        finally:
+            self._focus_lock.release()
 
     def capture_image(self, fast_mode=False):
         """Capture a photo into memory as a PIL image."""
-        self._settle_autofocus(fast_mode)
-        with self._camera_lock:
-            image = self.picam2.capture_image("main")
-        logging.info("Photo captured to memory")
-        return image
+        self._acquire_focus_lock()
+        try:
+            self._settle_autofocus(fast_mode)
+            with self._camera_lock:
+                image = self.picam2.capture_image("main")
+            logging.info("Photo captured to memory")
+            return image
+        finally:
+            self._focus_lock.release()
 
     def _settle_autofocus(self, fast_mode=False):
         """Give autofocus a short settle window before capture."""
@@ -2505,7 +2841,8 @@ def _create_fastapi_routes():
                     frame = await asyncio.to_thread(session.wait_for_frame, sequence)
                     if frame is None:
                         break
-                    sequence, jpeg = frame
+                    sequence, frame_data = frame
+                    jpeg = frame_data["jpeg"] if isinstance(frame_data, dict) else frame_data
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n"
@@ -2521,6 +2858,55 @@ def _create_fastapi_routes():
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
         )
+
+    @app.get("/api/preview/telemetry")
+    def api_preview_telemetry(client_id: str = ""):
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        if not client_id:
+            raise HTTPException(status_code=400, detail="Preview client ID is required")
+        try:
+            camera_system.update_activity()
+            return camera_system.camera_manager.get_preview_telemetry(client_id)
+        except PreviewSessionAccessDenied as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
+    @app.post("/api/preview/focus")
+    async def api_preview_focus(request: Request):
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        try:
+            body = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Focus body must be valid JSON") from error
+        if not isinstance(body, dict) or not body.get("client_id"):
+            raise HTTPException(status_code=400, detail="Preview client ID is required")
+
+        client_id = body["client_id"]
+        try:
+            camera_system.camera_manager.get_preview_telemetry(client_id)
+        except PreviewSessionAccessDenied as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
+        action = body.get("action")
+        try:
+            camera_system.update_activity()
+            if action == "set_mode":
+                mode = {"manual": 0, "auto": 1, "continuous": 2}.get(body.get("mode"))
+                if mode is None:
+                    raise FocusOperationError("Focus mode must be manual, auto, or continuous")
+                return camera_system.camera_manager.set_focus_mode(mode)
+            if action == "focus_center":
+                return camera_system.camera_manager.focus_center()
+            if action == "set_position":
+                return camera_system.camera_manager.set_focus_position(body.get("lens_position"))
+            raise FocusOperationError("Unknown focus action")
+        except FocusOperationBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except FocusOperationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/preview/stop")
     def api_preview_stop(client_id: str = ""):

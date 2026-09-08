@@ -484,6 +484,65 @@ select {
   padding-bottom: 14px;
 }
 
+.preview-telemetry {
+  display: flex;
+  gap: 12px 18px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.preview-telemetry strong {
+  color: var(--ink);
+  font-weight: 400;
+  text-transform: uppercase;
+}
+
+.focus-controls {
+  display: grid;
+  grid-template-columns: minmax(130px, 170px) minmax(180px, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--soft-line);
+}
+
+.focus-controls label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.focus-controls select,
+.focus-controls input {
+  width: 100%;
+}
+
+.focus-position-control {
+  grid-template-columns: minmax(0, 1fr) 42px;
+}
+
+.focus-position-control input {
+  grid-column: 1;
+}
+
+.focus-position-value {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--ink);
+  text-align: right;
+}
+
+.focus-status {
+  min-height: 18px;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .live-preview-stage {
   position: relative;
   aspect-ratio: 3 / 2;
@@ -757,6 +816,14 @@ select {
 
   .live-preview-panel {
     padding: 12px;
+  }
+
+  .focus-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .focus-position-control {
+    grid-template-columns: minmax(0, 1fr) 42px;
   }
 
   .preview-tabs,

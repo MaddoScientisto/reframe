@@ -1271,6 +1271,63 @@ async def preview_stream(request: Request):
         },
     )
 
+@app.get("/api/preview/telemetry")
+async def preview_telemetry(client_id: str):
+    """Return telemetry for the caller's active hardware preview session."""
+    try:
+        query = httpx.QueryParams({"client_id": client_id})
+        return await reframe_client.get(f"/preview/telemetry?{query}")
+    except httpx.HTTPStatusError as error:
+        try:
+            detail = error.response.json().get("detail", "Preview telemetry unavailable")
+        except ValueError:
+            detail = "Preview telemetry unavailable"
+        raise HTTPException(status_code=error.response.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Preview telemetry unavailable: {error}") from error
+
+@app.post("/api/preview/focus")
+async def preview_focus(body: Dict[str, Any]):
+    """Apply a focus control for the caller's active hardware preview session."""
+    if not isinstance(body, dict) or not body.get("client_id"):
+        raise HTTPException(status_code=400, detail="Preview client ID is required")
+
+    previous_mode = settings_manager.load_settings().get("camera", {}).get("autofocus_mode", 2)
+    try:
+        result = await reframe_client.post("/preview/focus", json=body)
+    except httpx.HTTPStatusError as error:
+        try:
+            detail = error.response.json().get("detail", "Focus control failed")
+        except ValueError:
+            detail = "Focus control failed"
+        raise HTTPException(status_code=error.response.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Focus service unavailable: {error}") from error
+
+    if body.get("action") == "set_mode":
+        mode = {"manual": 0, "auto": 1, "continuous": 2}.get(body.get("mode"))
+        if mode is None:
+            raise HTTPException(status_code=400, detail="Focus mode must be manual, auto, or continuous")
+        try:
+            if not settings_manager.save_settings({"camera": {"autofocus_mode": mode}}):
+                raise RuntimeError("Could not save focus mode")
+        except Exception as error:
+            previous_name = {0: "manual", 1: "auto", 2: "continuous"}.get(previous_mode, "continuous")
+            try:
+                await reframe_client.post(
+                    "/preview/focus",
+                    json={
+                        "client_id": body["client_id"],
+                        "action": "set_mode",
+                        "mode": previous_name,
+                    },
+                )
+            except Exception as rollback_error:
+                logging.error("Could not restore focus mode after settings failure: %s", rollback_error)
+            raise HTTPException(status_code=500, detail=f"Could not save focus mode: {error}") from error
+
+    return result
+
 @app.post("/api/preview/stop")
 async def stop_preview(request: Request):
     """Release the caller's hardware preview session."""

@@ -26,6 +26,15 @@ export function stopPreview(clientId) {
   return request(`/api/preview/stop?${params.toString()}`, { method: 'POST' })
 }
 
+export function getPreviewTelemetry(clientId) {
+  const params = new URLSearchParams({ client_id: clientId })
+  return request(`/api/preview/telemetry?${params.toString()}`)
+}
+
+export function setPreviewFocus(body) {
+  return jsonRequest('/api/preview/focus', 'POST', body)
+}
+
 export function getCarouselStatus() {
   return request('/api/carousel/status')
 }

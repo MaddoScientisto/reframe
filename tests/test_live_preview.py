@@ -2,6 +2,7 @@ import asyncio
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -45,6 +46,38 @@ class FakePicamera:
 
     def start(self):
         self.started = True
+
+
+class FakePreviewRequest:
+    def __init__(self, frame, metadata):
+        self.frame = frame
+        self.metadata = metadata
+        self.released = False
+
+    def make_array(self, stream_name):
+        self.asserted_stream = stream_name
+        return self.frame
+
+    def get_metadata(self):
+        return self.metadata
+
+    def release(self):
+        self.released = True
+
+
+class FakeFocusPicamera:
+    camera_controls = {"LensPosition": (0.0, 10.0, 5.0)}
+    camera_properties = {"PixelArraySize": (400, 300)}
+
+    def __init__(self):
+        self.control_calls = []
+        self.metadata = [{"AfState": 2, "LensPosition": 4.5}]
+
+    def set_controls(self, controls):
+        self.control_calls.append(controls)
+
+    def capture_metadata(self):
+        return self.metadata.pop(0) if self.metadata else {"AfState": 2, "LensPosition": 4.5}
 
 
 class LivePreviewTests(unittest.TestCase):
@@ -99,6 +132,94 @@ class LivePreviewTests(unittest.TestCase):
 
         session.stop()
         self.assertIsNone(session.wait_for_frame(sequence, timeout=0.01))
+
+    def test_preview_request_keeps_frame_metadata_together(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("NumPy is not installed")
+
+        request = FakePreviewRequest(
+            np.full((6, 4), 128, dtype=np.uint8),
+            {"ExposureTime": 8000, "LensPosition": 2.5},
+        )
+        picamera = Mock()
+        picamera.capture_request.return_value = request
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = picamera
+        manager._camera_lock = threading.Lock()
+        manager.preview_size = (4, 4)
+        manager.last_activity_monotonic = time.monotonic()
+
+        frame = manager.capture_preview_frame()
+
+        self.assertIsNotNone(frame["jpeg"])
+        self.assertEqual(frame["metadata"], {"ExposureTime": 8000, "LensPosition": 2.5})
+        self.assertEqual(request.asserted_stream, "lores")
+        self.assertTrue(request.released)
+
+    def test_preview_telemetry_exposes_metadata_and_focus_range(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager._preview_session_lock = threading.Lock()
+        manager._focus_mode = 2
+        manager.settings = {"camera": {"exposure_value": 0}}
+        manager.picam2 = FakeFocusPicamera()
+        session = reframe.CameraPreviewSession(manager, owner_id="desktop")
+        session._active = True
+        session._sequence = 7
+        session._latest_frame = {
+            "jpeg": b"jpeg",
+            "metadata": {
+                "ExposureTime": 8000,
+                "AnalogueGain": 2.0,
+                "AfMode": 2,
+                "AfState": 2,
+                "LensPosition": 4.5,
+            },
+            "captured_at": time.monotonic(),
+        }
+        session._frame_times = [time.monotonic() - 0.4, time.monotonic() - 0.2]
+        manager._preview_session = session
+
+        telemetry = manager.get_preview_telemetry("desktop")
+
+        self.assertEqual(telemetry["frame_sequence"], 7)
+        self.assertEqual(telemetry["exposure_time_us"], 8000)
+        self.assertEqual(telemetry["focus_mode"], "continuous")
+        self.assertEqual(telemetry["focus_state"], "focused")
+        self.assertEqual(telemetry["focus_range"], {"min": 0, "max": 10, "step": 0.1})
+        with self.assertRaises(reframe.PreviewSessionAccessDenied):
+            manager.get_preview_telemetry("other")
+
+    def test_manual_center_focus_restores_manual_mode(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeFocusPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._focus_mode = 0
+        manager._manual_focus_position = 2.0
+
+        result = manager.focus_center()
+
+        self.assertEqual(result["focus_mode"], "manual")
+        self.assertEqual(result["lens_position"], 4.5)
+        self.assertEqual(manager.picam2.control_calls[0]["AfWindows"], [(150, 112, 100, 75)])
+        self.assertEqual(manager.picam2.control_calls[-1], {"AfMode": 0, "LensPosition": 4.5})
+
+    def test_manual_position_rejects_auto_mode_and_out_of_range_values(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeFocusPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._focus_mode = 2
+        manager._manual_focus_position = None
+
+        with self.assertRaises(reframe.FocusOperationError):
+            manager.set_focus_position(4.0)
+
+        manager._focus_mode = 0
+        with self.assertRaises(reframe.FocusOperationError):
+            manager.set_focus_position(11.0)
 
     def test_preview_session_can_only_be_stopped_by_owner(self):
         manager = object.__new__(reframe.CameraManager)
