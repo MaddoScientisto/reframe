@@ -876,17 +876,23 @@ class CameraManager:
             step = control[3] if len(control) >= 4 else None
         else:
             return None
-        if not isinstance(minimum, (tuple, list)) or not isinstance(maximum, (tuple, list)):
-            return None
-        if len(minimum) < 2 or len(maximum) < 2:
-            return None
-        steps = step if isinstance(step, (tuple, list)) and len(step) >= 2 else (step, step)
-        ranges = {}
-        for name, index in (("red", 0), ("blue", 1)):
-            ranges[name] = self._control_range((minimum[index], maximum[index], None, steps[index]))
-            if ranges[name] is None:
+        if isinstance(minimum, (tuple, list)) or isinstance(maximum, (tuple, list)):
+            if not isinstance(minimum, (tuple, list)) or not isinstance(maximum, (tuple, list)):
                 return None
-        return ranges
+            if len(minimum) < 2 or len(maximum) < 2:
+                return None
+            steps = step if isinstance(step, (tuple, list)) and len(step) >= 2 else (step, step)
+            ranges = {}
+            for name, index in (("red", 0), ("blue", 1)):
+                ranges[name] = self._control_range((minimum[index], maximum[index], None, steps[index]))
+                if ranges[name] is None:
+                    return None
+            return ranges
+
+        common_range = self._control_range((minimum, maximum, None, step))
+        if common_range is None:
+            return None
+        return {"red": dict(common_range), "blue": dict(common_range)}
 
     def _supported_awb_modes(self):
         controls = getattr(self.picam2, "camera_controls", {}) or {}
@@ -896,9 +902,17 @@ class CameraManager:
         if isinstance(descriptor, dict):
             values = descriptor.get("values") or descriptor.get("enum")
             if isinstance(values, dict):
-                return [str(name).lower() for name in values]
+                return [
+                    str(name).lower()
+                    for name in values
+                    if str(name).lower() != "custom"
+                ]
             if isinstance(values, (tuple, list)):
-                return [AWB_MODE_NAMES[value] for value in values if value in AWB_MODE_NAMES]
+                return [
+                    AWB_MODE_NAMES[value]
+                    for value in values
+                    if value in AWB_MODE_NAMES and AWB_MODE_NAMES[value] != "custom"
+                ]
         if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 2:
             try:
                 minimum, maximum = int(descriptor[0]), int(descriptor[1])
@@ -906,7 +920,7 @@ class CameraManager:
                 return []
             return [
                 name for value, name in AWB_MODE_NAMES.items()
-                if minimum <= value <= maximum
+                if minimum <= value <= maximum and name != "custom"
             ]
         return []
 

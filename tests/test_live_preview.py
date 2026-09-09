@@ -268,6 +268,39 @@ class LivePreviewTests(unittest.TestCase):
             {"ExposureValue": 0.75},
         ])
 
+    def test_white_balance_custom_mode_is_not_reported_as_preset(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = SimpleNamespace(camera_controls={
+            "AwbEnable": (False, True, True),
+            "AwbMode": {"values": {
+                "auto": 0,
+                "daylight": 5,
+                "custom": 7,
+            }},
+            "ColourGains": ((0.0, 0.0), (8.0, 8.0), (1.0, 1.0)),
+        })
+
+        capabilities = manager.get_white_balance_capabilities()
+
+        self.assertNotIn("custom", capabilities["supported_presets"])
+        self.assertTrue(capabilities["manual_supported"])
+
+    def test_white_balance_scalar_colour_gains_range_supports_both_channels(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = SimpleNamespace(camera_controls={
+            "AwbEnable": (False, True, True),
+            "AwbMode": (0, 7, 0),
+            "ColourGains": (0.0, 32.0, None),
+        })
+
+        capabilities = manager.get_white_balance_capabilities()
+
+        self.assertEqual(capabilities["colour_gains_range"], {
+            "red": {"min": 0.0, "max": 32.0, "step": 0.32},
+            "blue": {"min": 0.0, "max": 32.0, "step": 0.32},
+        })
+        self.assertTrue(capabilities["manual_supported"])
+
     def test_exposure_mode_locks_current_values_and_restores_auto(self):
         manager = object.__new__(reframe.CameraManager)
         manager.picam2 = FakeControlPicamera()

@@ -2,6 +2,29 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { getPreviewTelemetry, setPreviewControls, setPreviewFocus, stopPreview } from '../api/dashboardApi'
 
+const previewPreferencesKey = 'reframe.livePreviewPreferences'
+
+function loadPreviewPreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(previewPreferencesKey) || '{}')
+    return saved && typeof saved === 'object' ? saved : {}
+  } catch {
+    return {}
+  }
+}
+
+function savePreviewPreferences(preferences) {
+  try {
+    localStorage.setItem(previewPreferencesKey, JSON.stringify(preferences))
+  } catch {}
+}
+
+function storedNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+const savedPreferences = loadPreviewPreferences()
+
 const props = defineProps({
   open: { type: Boolean, default: false },
   captureBusy: { type: Boolean, default: false },
@@ -15,27 +38,34 @@ const streamUrl = ref('/api/preview/stream')
 const streamKey = ref(0)
 const streamState = ref('connecting')
 const streamMounted = ref(false)
-const showGuidelines = ref(false)
+const showGuidelines = ref(savedPreferences.showGuidelines === true)
 const previewClientId = ref('')
 const telemetry = ref(null)
 const telemetryError = ref('')
-const focusMode = ref('continuous')
-const focusPosition = ref(null)
+const focusMode = ref(['manual', 'auto', 'continuous'].includes(savedPreferences.focusMode) ? savedPreferences.focusMode : 'continuous')
+const focusPosition = ref(storedNumber(savedPreferences.focusPosition, null))
 const focusDragging = ref(false)
 const focusBusy = ref(false)
 const focusError = ref('')
+const focusControlsOpen = ref(false)
 const exposureMode = ref('auto')
 const exposureModeBusy = ref(false)
 const exposureValue = ref(0)
 const exposureBusy = ref(false)
 const exposureError = ref('')
-const whiteBalanceMode = ref('auto')
-const whiteBalancePreset = ref('daylight')
-const redGain = ref(1)
-const blueGain = ref(1)
+const exposureControlsOpen = ref(false)
+const savedWhiteBalanceMode = ['auto', 'preset', 'manual'].includes(savedPreferences.whiteBalanceMode)
+  ? savedPreferences.whiteBalanceMode
+  : 'auto'
+const savedWhiteBalancePreset = savedPreferences.whiteBalancePreset || 'daylight'
+const whiteBalanceMode = ref(savedWhiteBalanceMode === 'preset' && savedWhiteBalancePreset === 'custom' ? 'manual' : savedWhiteBalanceMode)
+const whiteBalancePreset = ref(savedWhiteBalancePreset)
+const redGain = ref(storedNumber(savedPreferences.redGain, 1))
+const blueGain = ref(storedNumber(savedPreferences.blueGain, 1))
 const whiteBalanceDragging = ref(false)
 const whiteBalanceBusy = ref(false)
 const whiteBalanceError = ref('')
+const whiteBalanceControlsOpen = ref(false)
 let telemetryTimer = null
 let telemetryPollToken = 0
 let streamReleasePromise = Promise.resolve()
@@ -43,7 +73,22 @@ let streamReleasePromise = Promise.resolve()
 const focusRange = computed(() => telemetry.value?.focus_range || null)
 const focusModeLabel = computed(() => telemetry.value?.focus_mode || focusMode.value)
 const whiteBalanceCapabilities = computed(() => telemetry.value?.white_balance_capabilities || null)
+const whiteBalancePresets = computed(() => (whiteBalanceCapabilities.value?.supported_presets || [])
+  .filter((preset) => preset !== 'custom'))
 const cameraControlBusy = computed(() => focusBusy.value || exposureModeBusy.value || exposureBusy.value || whiteBalanceBusy.value)
+
+watch(
+  [showGuidelines, focusMode, focusPosition, whiteBalanceMode, whiteBalancePreset, redGain, blueGain],
+  () => savePreviewPreferences({
+    showGuidelines: showGuidelines.value,
+    focusMode: focusMode.value,
+    focusPosition: focusPosition.value,
+    whiteBalanceMode: whiteBalanceMode.value,
+    whiteBalancePreset: whiteBalancePreset.value,
+    redGain: redGain.value,
+    blueGain: blueGain.value,
+  }),
+)
 
 watch(
   () => props.open,
@@ -60,7 +105,9 @@ watch(
     streamKey.value += 1
     streamState.value = 'connecting'
     streamMounted.value = true
-    showGuidelines.value = false
+    focusControlsOpen.value = false
+    whiteBalanceControlsOpen.value = false
+    exposureControlsOpen.value = false
     telemetry.value = null
     telemetryError.value = ''
     focusError.value = ''
@@ -68,13 +115,7 @@ watch(
     exposureModeBusy.value = false
     exposureError.value = ''
     whiteBalanceError.value = ''
-    focusMode.value = 'continuous'
-    focusPosition.value = null
     exposureValue.value = 0
-    whiteBalanceMode.value = 'auto'
-    whiteBalancePreset.value = 'daylight'
-    redGain.value = 1
-    blueGain.value = 1
     startTelemetryPolling()
     await nextTick()
     if (!dialogRef.value?.open) dialogRef.value?.showModal()
@@ -140,6 +181,9 @@ async function pollTelemetry(token) {
     if (!whiteBalanceBusy.value && !whiteBalanceDragging.value) {
       if (result.white_balance_mode) whiteBalanceMode.value = result.white_balance_mode
       if (result.white_balance_preset) whiteBalancePreset.value = result.white_balance_preset
+      if (result.white_balance_mode === 'preset' && result.white_balance_preset === 'custom') {
+        whiteBalanceMode.value = 'manual'
+      }
       if (result.colour_gains) {
         redGain.value = Number(result.colour_gains.red)
         blueGain.value = Number(result.colour_gains.blue)
@@ -289,8 +333,9 @@ async function applyExposureMode() {
 }
 
 function supportedWhiteBalancePreset() {
-  const presets = whiteBalanceCapabilities.value?.supported_presets || []
-  return presets.includes(whiteBalancePreset.value) ? whiteBalancePreset.value : presets[0]
+  return whiteBalancePresets.value.includes(whiteBalancePreset.value)
+    ? whiteBalancePreset.value
+    : whiteBalancePresets.value[0]
 }
 
 async function applyWhiteBalance() {
@@ -359,35 +404,47 @@ onUnmounted(() => {
       <button class="icon-button" type="button" aria-label="Close live preview" @click="closeDialog">&times;</button>
     </div>
     <div class="preview-panel live-preview-panel">
-      <div class="preview-stage live-preview-stage" :style="{ aspectRatio }">
-        <img
-          v-if="streamMounted && open && streamState !== 'error'"
-          :key="streamKey"
-          class="live-preview-image"
-          :src="streamUrl"
-          alt="Live camera preview"
-          @load="handleImageLoad"
-          @error="handleImageError"
-        />
-        <div v-if="showGuidelines" class="shooting-guidelines" aria-hidden="true">
-          <span class="guideline-line guideline-vertical guideline-vertical-left"></span>
-          <span class="guideline-line guideline-vertical guideline-vertical-right"></span>
-          <span class="guideline-line guideline-horizontal guideline-horizontal-top"></span>
-          <span class="guideline-line guideline-horizontal guideline-horizontal-bottom"></span>
-          <span class="guideline-crosshair guideline-crosshair-horizontal"></span>
-          <span class="guideline-crosshair guideline-crosshair-vertical"></span>
+      <div class="live-preview-sticky-header">
+        <div class="preview-stage live-preview-stage" :style="{ aspectRatio }">
+          <img
+            v-if="streamMounted && open && streamState !== 'error'"
+            :key="streamKey"
+            class="live-preview-image"
+            :src="streamUrl"
+            alt="Live camera preview"
+            @load="handleImageLoad"
+            @error="handleImageError"
+          />
+          <div v-if="showGuidelines" class="shooting-guidelines" aria-hidden="true">
+            <span class="guideline-line guideline-vertical guideline-vertical-left"></span>
+            <span class="guideline-line guideline-vertical guideline-vertical-right"></span>
+            <span class="guideline-line guideline-horizontal guideline-horizontal-top"></span>
+            <span class="guideline-line guideline-horizontal guideline-horizontal-bottom"></span>
+            <span class="guideline-crosshair guideline-crosshair-horizontal"></span>
+            <span class="guideline-crosshair guideline-crosshair-vertical"></span>
+          </div>
+          <span v-if="streamState === 'connecting'" class="preview-placeholder">connecting to camera...</span>
+          <span v-else-if="streamState === 'stalled'" class="preview-placeholder">camera feed stalled</span>
+          <span v-else-if="streamState === 'disconnected'" class="preview-placeholder">camera feed disconnected</span>
         </div>
-        <span v-if="streamState === 'connecting'" class="preview-placeholder">connecting to camera...</span>
-        <span v-else-if="streamState === 'stalled'" class="preview-placeholder">camera feed stalled</span>
-        <span v-else-if="streamState === 'disconnected'" class="preview-placeholder">camera feed disconnected</span>
+        <div class="preview-quick-actions">
+          <label class="guidelines-toggle">
+            <input v-model="showGuidelines" type="checkbox" />
+            shooting guidelines
+          </label>
+          <button class="action-button secondary" type="button" :disabled="cameraControlBusy || !telemetry" @click="focusCenter">
+            {{ focusBusy ? 'focusing...' : 'focus center' }}
+          </button>
+          <button class="action-button primary" type="button" :disabled="captureBusy" @click="emit('capture')">
+            {{ captureBusy ? 'capturing...' : 'capture photo' }}
+          </button>
+        </div>
       </div>
-      <label class="guidelines-toggle">
-        <input v-model="showGuidelines" type="checkbox" />
-        shooting guidelines
-      </label>
-      <p class="dialog-status" role="status" aria-live="polite">
-        {{ streamState === 'live' ? 'camera live' : streamState === 'stalled' ? 'waiting for a fresh frame' : streamState === 'disconnected' ? 'camera disconnected' : 'starting camera stream...' }}
-      </p>
+      <div class="preview-utility-row">
+        <p class="dialog-status" role="status" aria-live="polite">
+          {{ streamState === 'live' ? 'camera live' : streamState === 'stalled' ? 'waiting for a fresh frame' : streamState === 'disconnected' ? 'camera disconnected' : 'starting camera stream...' }}
+        </p>
+      </div>
       <div v-if="telemetry" class="preview-telemetry" aria-label="Camera telemetry">
         <span><strong>shutter</strong> {{ formatShutter(telemetry.exposure_time_us) }}</span>
         <span><strong>gain</strong> {{ formatValue(telemetry.analogue_gain, 'x') }}</span>
@@ -398,46 +455,61 @@ onUnmounted(() => {
         <span v-if="telemetry.lux !== undefined"><strong>lux</strong> {{ formatValue(telemetry.lux) }}</span>
       </div>
       <p v-if="telemetryError" class="inline-error">{{ telemetryError }}</p>
-      <div class="preview-camera-controls">
-        <label v-if="telemetry?.exposure_capabilities?.supported">
-          exposure mode
-          <select v-model="exposureMode" :disabled="cameraControlBusy" @change="applyExposureMode">
-            <option value="auto">auto</option>
-            <option v-if="telemetry?.exposure_capabilities?.manual_supported" value="manual">manual (lock current)</option>
-          </select>
-          <span v-if="exposureMode === 'manual'" class="control-value">
-            {{ formatShutter(telemetry.exposure_time_us) }} / {{ formatValue(telemetry.analogue_gain, 'x') }}
-          </span>
-        </label>
-        <label>
-          exposure value
-          <input
-            v-model.number="exposureValue"
-            type="range"
-            min="-2"
-            max="2"
-            step="0.25"
-            :disabled="cameraControlBusy || !telemetry || exposureMode !== 'auto'"
-            @change="applyExposureValue"
-          />
-          <span class="control-value">EV {{ Number(exposureValue).toFixed(2) }}</span>
-        </label>
-        <div v-if="whiteBalanceCapabilities?.supported" class="white-balance-controls">
+      <details class="preview-controls-disclosure" :open="focusControlsOpen" @toggle="focusControlsOpen = $event.currentTarget.open">
+        <summary class="preview-controls-summary">
+          <span>focus mode</span>
+          <span class="preview-controls-summary-state">{{ focusModeLabel }}</span>
+        </summary>
+        <div class="focus-controls preview-control-content">
           <label>
-            white balance
+            focus mode
+            <select v-model="focusMode" :disabled="cameraControlBusy" @change="applyFocusMode">
+              <option value="manual">manual</option>
+              <option value="auto">auto</option>
+              <option value="continuous">continuous</option>
+            </select>
+          </label>
+          <label class="focus-position-control">
+            lens position
+            <input
+              type="range"
+              :min="focusRange?.min ?? 0"
+              :max="focusRange?.max ?? 1"
+              :step="focusRange?.step ?? 0.1"
+              :value="focusPosition ?? focusRange?.min ?? 0"
+              :disabled="focusMode !== 'manual' || cameraControlBusy || !focusRange"
+              @input="startFocusDrag"
+              @change="applyFocusPosition"
+            />
+            <span class="focus-position-value">{{ focusPosition === null ? '--' : Number(focusPosition).toFixed(1) }}</span>
+          </label>
+        </div>
+        <p class="focus-status" role="status" aria-live="polite">
+          {{ focusError || `mode: ${focusModeLabel}` }}
+        </p>
+      </details>
+      <details class="preview-controls-disclosure" :open="whiteBalanceControlsOpen" @toggle="whiteBalanceControlsOpen = $event.currentTarget.open">
+        <summary class="preview-controls-summary">
+          <span>white balance mode</span>
+          <span class="preview-controls-summary-state">{{ whiteBalanceMode }}</span>
+        </summary>
+        <div v-if="whiteBalanceCapabilities?.supported" class="white-balance-controls preview-control-content">
+          <label>
+            white balance mode
             <select v-model="whiteBalanceMode" :disabled="cameraControlBusy" @change="applyWhiteBalance">
               <option value="auto">auto</option>
               <option v-if="whiteBalanceCapabilities.preset_supported" value="preset">preset</option>
-              <option v-if="whiteBalanceCapabilities.manual_supported" value="manual">manual gains</option>
+              <option v-if="whiteBalanceCapabilities.manual_supported" value="manual">custom</option>
             </select>
           </label>
           <label v-if="whiteBalanceMode === 'preset'">
             preset
             <select v-model="whiteBalancePreset" :disabled="cameraControlBusy" @change="applyWhiteBalance">
-              <option v-for="preset in whiteBalanceCapabilities.supported_presets" :key="preset" :value="preset">{{ preset }}</option>
+              <option v-for="preset in whiteBalancePresets" :key="preset" :value="preset">{{ preset }}</option>
             </select>
           </label>
-          <template v-if="whiteBalanceMode === 'manual' && whiteBalanceCapabilities.manual_supported">
+          <div v-if="whiteBalanceMode === 'manual' && whiteBalanceCapabilities.manual_supported" class="custom-white-balance">
+            <span class="control-section-label">custom white balance</span>
             <label>
               red gain
               <input
@@ -466,45 +538,45 @@ onUnmounted(() => {
               />
               <span class="control-value">{{ formatValue(blueGain, 'x') }}</span>
             </label>
-          </template>
+          </div>
         </div>
-      </div>
-      <p v-if="exposureError || whiteBalanceError" class="inline-error">{{ exposureError || whiteBalanceError }}</p>
-      <div class="focus-controls">
-        <label>
-          focus mode
-          <select v-model="focusMode" :disabled="cameraControlBusy" @change="applyFocusMode">
-            <option value="manual">manual</option>
-            <option value="auto">auto</option>
-            <option value="continuous">continuous</option>
-          </select>
-        </label>
-        <label class="focus-position-control">
-          lens position
-          <input
-            type="range"
-            :min="focusRange?.min ?? 0"
-            :max="focusRange?.max ?? 1"
-            :step="focusRange?.step ?? 0.1"
-            :value="focusPosition ?? focusRange?.min ?? 0"
-            :disabled="focusMode !== 'manual' || cameraControlBusy || !focusRange"
-            @input="startFocusDrag"
-            @change="applyFocusPosition"
-          />
-          <span class="focus-position-value">{{ focusPosition === null ? '--' : Number(focusPosition).toFixed(1) }}</span>
-        </label>
-        <button class="action-button secondary" type="button" :disabled="cameraControlBusy || !telemetry" @click="focusCenter">
-          {{ focusBusy ? 'focusing...' : 'focus center' }}
-        </button>
-      </div>
-      <p class="focus-status" role="status" aria-live="polite">
-        {{ focusError || `mode: ${focusModeLabel}` }}
-      </p>
+        <p v-else class="control-unavailable">white-balance capabilities are not available yet</p>
+        <p v-if="whiteBalanceError" class="inline-error">{{ whiteBalanceError }}</p>
+      </details>
+      <details class="preview-controls-disclosure" :open="exposureControlsOpen" @toggle="exposureControlsOpen = $event.currentTarget.open">
+        <summary class="preview-controls-summary">
+          <span>exposure</span>
+          <span class="preview-controls-summary-state">{{ exposureMode }}</span>
+        </summary>
+        <div class="exposure-controls preview-control-content">
+          <label>
+            exposure mode
+            <select v-model="exposureMode" :disabled="cameraControlBusy || !telemetry?.exposure_capabilities?.supported" @change="applyExposureMode">
+              <option value="auto">auto</option>
+              <option v-if="telemetry?.exposure_capabilities?.manual_supported" value="manual">manual (lock current)</option>
+            </select>
+            <span v-if="exposureMode === 'manual' && telemetry" class="control-value">
+              {{ formatShutter(telemetry.exposure_time_us) }} / {{ formatValue(telemetry.analogue_gain, 'x') }}
+            </span>
+          </label>
+          <label>
+            exposure value
+            <input
+              v-model.number="exposureValue"
+              type="range"
+              min="-2"
+              max="2"
+              step="0.25"
+              :disabled="cameraControlBusy || !telemetry || exposureMode !== 'auto'"
+              @change="applyExposureValue"
+            />
+            <span class="control-value">EV {{ Number(exposureValue).toFixed(2) }}</span>
+          </label>
+        </div>
+        <p v-if="exposureError" class="inline-error">{{ exposureError }}</p>
+      </details>
     </div>
     <div class="dialog-actions live-preview-actions">
-      <button class="action-button primary" type="button" :disabled="captureBusy" @click="emit('capture')">
-        {{ captureBusy ? 'capturing...' : 'capture photo' }}
-      </button>
       <button v-if="streamState === 'disconnected'" class="action-button secondary" type="button" @click="retryStream">retry</button>
       <button class="action-button secondary" type="button" @click="closeDialog">close</button>
     </div>
