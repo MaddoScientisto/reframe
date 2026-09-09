@@ -29,8 +29,14 @@ function defaultSettings() {
     camera: {
       resolution: { width: 1200, height: 800 },
       exposure_value: 0,
+      exposure_mode: 'auto',
+      manual_exposure_time_us: null,
+      manual_analogue_gain: null,
       sharpness: 3,
       autofocus_mode: 2,
+      white_balance_mode: 'auto',
+      white_balance_preset: 'daylight',
+      white_balance_gains: { red: 1, blue: 1 },
     },
     processing: {
       saturation: 0.6,

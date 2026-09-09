@@ -99,6 +99,17 @@ BUTTON_POLL_INTERVAL_SECONDS = 0.025
 LIVE_PREVIEW_MAX_SIZE = (640, 480)
 LIVE_PREVIEW_FPS = 5
 LIVE_PREVIEW_JPEG_QUALITY = 75
+AWB_MODE_VALUES = {
+    "auto": 0,
+    "incandescent": 1,
+    "tungsten": 2,
+    "fluorescent": 3,
+    "indoor": 4,
+    "daylight": 5,
+    "cloudy": 6,
+    "custom": 7,
+}
+AWB_MODE_NAMES = {value: name for name, value in AWB_MODE_VALUES.items()}
 
 # Color palettes for dithering. We blend between the two to create a saturated look while preserving details.
 # Idea from https://github.com/pimoroni/inky
@@ -215,6 +226,10 @@ class FocusOperationBusy(RuntimeError):
 
 
 class FocusOperationError(RuntimeError):
+    pass
+
+
+class PreviewControlError(RuntimeError):
     pass
 
 
@@ -465,8 +480,19 @@ class CameraManager:
         self.picam2 = Picamera2()
         self._camera_lock = threading.Lock()
         self._focus_lock = threading.Lock()
-        self._focus_mode = self.settings.get("camera", {}).get("autofocus_mode", 2)
+        camera_settings = self.settings.get("camera", {})
+        self._focus_mode = camera_settings.get("autofocus_mode", 2)
         self._manual_focus_position = None
+        self._exposure_mode = camera_settings.get("exposure_mode", "auto")
+        self._manual_exposure_time_us = camera_settings.get("manual_exposure_time_us")
+        self._manual_analogue_gain = camera_settings.get("manual_analogue_gain")
+        self._white_balance_mode = camera_settings.get("white_balance_mode", "auto")
+        self._white_balance_preset = camera_settings.get("white_balance_preset", "daylight")
+        white_balance_gains = camera_settings.get("white_balance_gains", {})
+        self._white_balance_gains = {
+            "red": white_balance_gains.get("red", 1.0),
+            "blue": white_balance_gains.get("blue", 1.0),
+        }
         self._preview_session_lock = threading.Lock()
         self._preview_session = None
         self.last_activity_monotonic = time.monotonic()
@@ -485,6 +511,13 @@ class CameraManager:
             carousel.setdefault("interval_seconds", 30)
             carousel.setdefault("photo_ids", [])
             carousel.setdefault("shuffle", False)
+            camera = settings.get("camera")
+            if not isinstance(camera, dict):
+                camera = {}
+                settings["camera"] = camera
+            camera.setdefault("exposure_mode", "auto")
+            camera.setdefault("manual_exposure_time_us", None)
+            camera.setdefault("manual_analogue_gain", None)
             return settings
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logging.warning(f"Could not load settings from {self.settings_path}: {e}")
@@ -493,8 +526,14 @@ class CameraManager:
                 "camera": {
                     "resolution": {"width": 1200, "height": 800},
                     "exposure_value": 0,
+                    "exposure_mode": "auto",
+                    "manual_exposure_time_us": None,
+                    "manual_analogue_gain": None,
                     "sharpness": 3,
-                    "autofocus_mode": 2
+                    "autofocus_mode": 2,
+                    "white_balance_mode": "auto",
+                    "white_balance_preset": "daylight",
+                    "white_balance_gains": {"red": 1.0, "blue": 1.0}
                 },
                 "processing": {
                     "saturation": 0.6,
@@ -529,6 +568,17 @@ class CameraManager:
         """Reload settings from file and reconfigure camera."""
         old_settings = self.settings.copy()
         self.settings = self.load_settings()
+        camera_settings = self.settings.get("camera", {})
+        self._exposure_mode = camera_settings.get("exposure_mode", "auto")
+        self._manual_exposure_time_us = camera_settings.get("manual_exposure_time_us")
+        self._manual_analogue_gain = camera_settings.get("manual_analogue_gain")
+        self._white_balance_mode = camera_settings.get("white_balance_mode", "auto")
+        self._white_balance_preset = camera_settings.get("white_balance_preset", "daylight")
+        white_balance_gains = camera_settings.get("white_balance_gains", {})
+        self._white_balance_gains = {
+            "red": white_balance_gains.get("red", 1.0),
+            "blue": white_balance_gains.get("blue", 1.0),
+        }
 
         # Only reconfigure if camera settings changed
         camera_changed = old_settings.get("camera", {}) != self.settings.get("camera", {})
@@ -548,11 +598,14 @@ class CameraManager:
 
         if "exposure_value" in camera_settings:
             controls["ExposureValue"] = camera_settings["exposure_value"]
+        controls.update(self._exposure_controls_from_settings(camera_settings))
         if "sharpness" in camera_settings:
             controls["Sharpness"] = camera_settings["sharpness"]
         if "autofocus_mode" in camera_settings:
             controls["AfMode"] = camera_settings["autofocus_mode"]
             self._focus_mode = camera_settings["autofocus_mode"]
+
+        controls.update(self._white_balance_controls_from_settings(camera_settings))
 
         with self._camera_lock:
             for control_name, control_value in controls.items():
@@ -642,6 +695,8 @@ class CameraManager:
                 "ExposureValue": camera_settings.get("exposure_value", 0),
                 "Sharpness": camera_settings.get("sharpness", 3)
             }
+            controls.update(self._exposure_controls_from_settings(camera_settings))
+            controls.update(self._white_balance_controls_from_settings(camera_settings))
             camera_config["controls"] = controls
 
             try:
@@ -665,6 +720,13 @@ class CameraManager:
                 self._focus_mode = af_mode
             except Exception as e:
                 logging.warning(f"Could not set autofocus mode: {e}")
+
+            try:
+                white_balance_controls = self._white_balance_controls_from_settings(camera_settings)
+                if white_balance_controls:
+                    self.picam2.set_controls(white_balance_controls)
+            except PreviewControlError as e:
+                logging.warning(f"Could not apply white balance settings: {e}")
 
             self.picam2.start()
 
@@ -768,6 +830,339 @@ class CameraManager:
         return int(number) if number.is_integer() and isinstance(value, int) else number
 
     @staticmethod
+    def _metadata_pair(metadata, key):
+        value = metadata.get(key)
+        if not isinstance(value, (tuple, list)) or len(value) < 2:
+            return None
+        try:
+            pair = (float(value[0]), float(value[1]))
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in pair):
+            return None
+        return pair
+
+    @staticmethod
+    def _control_range(control):
+        if isinstance(control, dict):
+            minimum = control.get("min")
+            maximum = control.get("max")
+            step = control.get("step")
+        elif isinstance(control, (tuple, list)) and len(control) >= 2:
+            minimum, maximum = control[:2]
+            step = control[3] if len(control) >= 4 else None
+        else:
+            return None
+        try:
+            minimum = float(minimum)
+            maximum = float(maximum)
+            step = float(step) if step is not None else None
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in (minimum, maximum)) or maximum <= minimum:
+            return None
+        if step is None or not math.isfinite(step) or step <= 0:
+            step = round((maximum - minimum) / 100, 3)
+        return {"min": minimum, "max": maximum, "step": step}
+
+    def _colour_gains_range(self):
+        control = (getattr(self.picam2, "camera_controls", {}) or {}).get("ColourGains")
+        if isinstance(control, dict):
+            minimum = control.get("min")
+            maximum = control.get("max")
+            step = control.get("step")
+        elif isinstance(control, (tuple, list)) and len(control) >= 2:
+            minimum, maximum = control[:2]
+            step = control[3] if len(control) >= 4 else None
+        else:
+            return None
+        if not isinstance(minimum, (tuple, list)) or not isinstance(maximum, (tuple, list)):
+            return None
+        if len(minimum) < 2 or len(maximum) < 2:
+            return None
+        steps = step if isinstance(step, (tuple, list)) and len(step) >= 2 else (step, step)
+        ranges = {}
+        for name, index in (("red", 0), ("blue", 1)):
+            ranges[name] = self._control_range((minimum[index], maximum[index], None, steps[index]))
+            if ranges[name] is None:
+                return None
+        return ranges
+
+    def _supported_awb_modes(self):
+        controls = getattr(self.picam2, "camera_controls", {}) or {}
+        descriptor = controls.get("AwbMode")
+        if descriptor is None:
+            return []
+        if isinstance(descriptor, dict):
+            values = descriptor.get("values") or descriptor.get("enum")
+            if isinstance(values, dict):
+                return [str(name).lower() for name in values]
+            if isinstance(values, (tuple, list)):
+                return [AWB_MODE_NAMES[value] for value in values if value in AWB_MODE_NAMES]
+        if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 2:
+            try:
+                minimum, maximum = int(descriptor[0]), int(descriptor[1])
+            except (TypeError, ValueError):
+                return []
+            return [
+                name for value, name in AWB_MODE_NAMES.items()
+                if minimum <= value <= maximum
+            ]
+        return []
+
+    def get_white_balance_capabilities(self):
+        controls = getattr(self.picam2, "camera_controls", {}) or {}
+        supported_presets = self._supported_awb_modes()
+        gains_range = self._colour_gains_range()
+        return {
+            "supported": "AwbEnable" in controls,
+            "manual_supported": gains_range is not None and "AwbEnable" in controls,
+            "preset_supported": bool(supported_presets) and "AwbEnable" in controls,
+            "supported_presets": supported_presets,
+            "colour_gains_range": gains_range,
+        }
+
+    def _white_balance_controls_from_settings(self, camera_settings, strict=False):
+        mode = camera_settings.get("white_balance_mode", "auto")
+        preset = camera_settings.get("white_balance_preset", "daylight")
+        gains = camera_settings.get("white_balance_gains", {})
+        red_gain = gains.get("red", 1.0) if isinstance(gains, dict) else 1.0
+        blue_gain = gains.get("blue", 1.0) if isinstance(gains, dict) else 1.0
+        if not self.get_white_balance_capabilities()["supported"]:
+            return {}
+        try:
+            return self._white_balance_controls(mode, preset, red_gain, blue_gain)
+        except PreviewControlError:
+            if strict:
+                raise
+            return {}
+
+    def _white_balance_controls(self, mode, preset, red_gain, blue_gain):
+        capabilities = self.get_white_balance_capabilities()
+        if mode not in {"auto", "preset", "manual"}:
+            raise PreviewControlError("White-balance mode must be auto, preset, or manual")
+        if not capabilities["supported"]:
+            raise PreviewControlError("White-balance controls are unavailable")
+        if mode == "auto":
+            controls = {"AwbEnable": True}
+            if "auto" in capabilities["supported_presets"]:
+                controls["AwbMode"] = AWB_MODE_VALUES["auto"]
+            return controls
+        if mode == "preset":
+            if preset not in capabilities["supported_presets"]:
+                raise PreviewControlError(f"Unsupported white-balance preset: {preset}")
+            return {"AwbEnable": True, "AwbMode": AWB_MODE_VALUES[preset]}
+        if not capabilities["manual_supported"]:
+            raise PreviewControlError("Manual white-balance gains are unavailable")
+        gains_range = capabilities["colour_gains_range"]
+        try:
+            red_gain = float(red_gain)
+            blue_gain = float(blue_gain)
+        except (TypeError, ValueError) as error:
+            raise PreviewControlError("White-balance gains must be numbers") from error
+        if not all(math.isfinite(value) for value in (red_gain, blue_gain)):
+            raise PreviewControlError("White-balance gains must be finite")
+        for name, value in (("red", red_gain), ("blue", blue_gain)):
+            gain_range = gains_range[name]
+            if value < gain_range["min"] or value > gain_range["max"]:
+                raise PreviewControlError(
+                    f"{name} white-balance gain must be between "
+                    f"{gain_range['min']} and {gain_range['max']}"
+                )
+        return {"AwbEnable": False, "ColourGains": (red_gain, blue_gain)}
+
+    def get_exposure_capabilities(self):
+        controls = getattr(self.picam2, "camera_controls", {}) or {}
+        exposure_time_range = self._control_range(controls.get("ExposureTime"))
+        analogue_gain_range = self._control_range(controls.get("AnalogueGain"))
+        manual_supported = (
+            "AeEnable" in controls
+            and exposure_time_range is not None
+            and analogue_gain_range is not None
+        )
+        return {
+            "supported": "AeEnable" in controls,
+            "manual_supported": manual_supported,
+            "exposure_time_range": exposure_time_range,
+            "analogue_gain_range": analogue_gain_range,
+        }
+
+    def _validate_manual_exposure(self, exposure_time_us, analogue_gain):
+        capabilities = self.get_exposure_capabilities()
+        if not capabilities["manual_supported"]:
+            raise PreviewControlError("Manual exposure controls are unavailable")
+        try:
+            exposure_time_us = float(exposure_time_us)
+            analogue_gain = float(analogue_gain)
+        except (TypeError, ValueError) as error:
+            raise PreviewControlError("Manual exposure values must be numbers") from error
+        if not all(math.isfinite(value) for value in (exposure_time_us, analogue_gain)):
+            raise PreviewControlError("Manual exposure values must be finite")
+        exposure_time_range = capabilities["exposure_time_range"]
+        analogue_gain_range = capabilities["analogue_gain_range"]
+        if exposure_time_us < exposure_time_range["min"] or exposure_time_us > exposure_time_range["max"]:
+            raise PreviewControlError(
+                f"Exposure time must be between {exposure_time_range['min']} and "
+                f"{exposure_time_range['max']} microseconds"
+            )
+        if analogue_gain < analogue_gain_range["min"] or analogue_gain > analogue_gain_range["max"]:
+            raise PreviewControlError(
+                f"Analogue gain must be between {analogue_gain_range['min']} and "
+                f"{analogue_gain_range['max']}"
+            )
+        return int(round(exposure_time_us)), analogue_gain
+
+    def _current_exposure_values(self):
+        metadata = {}
+        session = getattr(self, "_preview_session", None)
+        if session is not None and session.is_active():
+            frame_info = session.get_frame_telemetry()
+            frame = frame_info.get("frame") or {}
+            metadata = frame.get("metadata", {}) if isinstance(frame, dict) else {}
+        if not metadata and hasattr(self.picam2, "capture_metadata"):
+            with self._camera_lock:
+                metadata = dict(self.picam2.capture_metadata() or {})
+
+        exposure_time_us = self._metadata_number(metadata, "ExposureTime")
+        analogue_gain = self._metadata_number(metadata, "AnalogueGain")
+        if exposure_time_us is None:
+            exposure_time_us = self._manual_exposure_time_us
+        if analogue_gain is None:
+            analogue_gain = self._manual_analogue_gain
+        if exposure_time_us is None or analogue_gain is None:
+            raise PreviewControlError("Current exposure values are unavailable")
+        return self._validate_manual_exposure(exposure_time_us, analogue_gain)
+
+    def _exposure_controls_from_settings(self, camera_settings, strict=False):
+        mode = camera_settings.get("exposure_mode", "auto")
+        if mode not in {"auto", "manual"}:
+            if strict:
+                raise PreviewControlError("Exposure mode must be auto or manual")
+            return {}
+        capabilities = self.get_exposure_capabilities()
+        if not capabilities["supported"]:
+            return {}
+        if mode == "auto":
+            return {"AeEnable": True}
+        exposure_time_us = camera_settings.get("manual_exposure_time_us")
+        analogue_gain = camera_settings.get("manual_analogue_gain")
+        if exposure_time_us is None or analogue_gain is None:
+            if strict:
+                raise PreviewControlError("Manual exposure values are unavailable")
+            return {}
+        try:
+            exposure_time_us, analogue_gain = self._validate_manual_exposure(
+                exposure_time_us, analogue_gain
+            )
+        except PreviewControlError:
+            if strict:
+                raise
+            return {}
+        return {
+            "AeEnable": False,
+            "ExposureTime": exposure_time_us,
+            "AnalogueGain": analogue_gain,
+        }
+
+    def set_exposure_value(self, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise PreviewControlError("Exposure value must be a number")
+        value = float(value)
+        if not math.isfinite(value) or value < -2 or value > 2:
+            raise PreviewControlError("Exposure value must be between -2 and 2")
+        if getattr(self, "_exposure_mode", "auto") != "auto":
+            raise PreviewControlError("Exposure value is available only in auto exposure mode")
+        self._acquire_focus_lock()
+        try:
+            with self._camera_lock:
+                self.picam2.set_controls({"ExposureValue": value})
+            self.settings.setdefault("camera", {})["exposure_value"] = value
+            return {
+                "success": True,
+                "exposure_value": value,
+                "message": "Exposure value updated",
+            }
+        except Exception as error:
+            raise PreviewControlError(f"Could not set exposure value: {error}") from error
+        finally:
+            self._focus_lock.release()
+
+    def set_exposure_mode(self, mode, exposure_time_us=None, analogue_gain=None):
+        if mode not in {"auto", "manual"}:
+            raise PreviewControlError("Exposure mode must be auto or manual")
+        capabilities = self.get_exposure_capabilities()
+        if not capabilities["supported"]:
+            raise PreviewControlError("Exposure mode controls are unavailable")
+        if mode == "manual":
+            if exposure_time_us is None or analogue_gain is None:
+                exposure_time_us, analogue_gain = self._current_exposure_values()
+            else:
+                exposure_time_us, analogue_gain = self._validate_manual_exposure(
+                    exposure_time_us, analogue_gain
+                )
+            controls = {
+                "AeEnable": False,
+                "ExposureTime": exposure_time_us,
+                "AnalogueGain": analogue_gain,
+            }
+        else:
+            controls = {"AeEnable": True}
+        self._acquire_focus_lock()
+        try:
+            with self._camera_lock:
+                self.picam2.set_controls(controls)
+            self._exposure_mode = mode
+            result = {
+                "success": True,
+                "exposure_mode": mode,
+                "message": f"Exposure mode set to {mode}",
+            }
+            if mode == "manual":
+                self._manual_exposure_time_us = exposure_time_us
+                self._manual_analogue_gain = analogue_gain
+                result.update({
+                    "exposure_time_us": exposure_time_us,
+                    "analogue_gain": analogue_gain,
+                })
+            return result
+        except Exception as error:
+            if isinstance(error, PreviewControlError):
+                raise
+            raise PreviewControlError(f"Could not set exposure mode: {error}") from error
+        finally:
+            self._focus_lock.release()
+
+    def set_white_balance(self, mode, preset="daylight", red_gain=None, blue_gain=None):
+        current_gains = self._white_balance_gains
+        if red_gain is None:
+            red_gain = current_gains["red"]
+        if blue_gain is None:
+            blue_gain = current_gains["blue"]
+        controls = self._white_balance_controls(mode, preset, red_gain, blue_gain)
+        self._acquire_focus_lock()
+        try:
+            with self._camera_lock:
+                self.picam2.set_controls(controls)
+            self._white_balance_mode = mode
+            if mode == "preset":
+                self._white_balance_preset = preset
+            if mode == "manual":
+                self._white_balance_gains = {"red": float(red_gain), "blue": float(blue_gain)}
+            return {
+                "success": True,
+                "white_balance_mode": mode,
+                "white_balance_preset": self._white_balance_preset,
+                "colour_gains": dict(self._white_balance_gains),
+                "message": "White balance updated",
+            }
+        except Exception as error:
+            if isinstance(error, PreviewControlError):
+                raise
+            raise PreviewControlError(f"Could not set white balance: {error}") from error
+        finally:
+            self._focus_lock.release()
+
+    @staticmethod
     def _focus_mode_name(mode):
         return {0: "manual", 1: "auto", 2: "continuous"}.get(mode)
 
@@ -831,10 +1226,38 @@ class CameraManager:
             "focus_state_value": focus_state,
             "lens_position": self._metadata_number(metadata, "LensPosition"),
             "focus_range": self.get_focus_range(),
+            "exposure_mode": getattr(self, "_exposure_mode", "auto"),
+            "exposure_capabilities": self.get_exposure_capabilities(),
             "exposure_value": self._metadata_number(
                 self.settings.get("camera", {}), "exposure_value"
             ),
+            "white_balance_mode": getattr(self, "_white_balance_mode", "auto"),
+            "white_balance_preset": getattr(self, "_white_balance_preset", "daylight"),
+            "white_balance_capabilities": self.get_white_balance_capabilities(),
         }
+
+        colour_gains = self._metadata_pair(metadata, "ColourGains")
+        if colour_gains is None:
+            stored_gains = getattr(self, "_white_balance_gains", {})
+            if isinstance(stored_gains, dict):
+                colour_gains = (
+                    stored_gains.get("red"),
+                    stored_gains.get("blue"),
+                )
+                if not all(isinstance(value, (int, float)) for value in colour_gains):
+                    colour_gains = None
+        if colour_gains is not None:
+            telemetry["colour_gains"] = {
+                "red": colour_gains[0],
+                "blue": colour_gains[1],
+            }
+
+        awb_mode = self._metadata_number(metadata, "AwbMode")
+        if awb_mode is not None:
+            telemetry["awb_mode_value"] = awb_mode
+            telemetry["awb_mode"] = AWB_MODE_NAMES.get(awb_mode)
+        if "AwbEnable" in metadata:
+            telemetry["awb_enabled"] = bool(metadata["AwbEnable"])
 
         metadata_fields = {
             "exposure_time_us": "ExposureTime",
@@ -2906,6 +3329,48 @@ def _create_fastapi_routes():
         except FocusOperationBusy as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except FocusOperationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/preview/controls")
+    async def api_preview_controls(request: Request):
+        global camera_system
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        try:
+            body = await request.json()
+        except Exception as error:
+            raise HTTPException(status_code=400, detail="Preview controls body must be valid JSON") from error
+        if not isinstance(body, dict) or not body.get("client_id"):
+            raise HTTPException(status_code=400, detail="Preview client ID is required")
+
+        client_id = body["client_id"]
+        try:
+            camera_system.camera_manager.get_preview_telemetry(client_id)
+        except PreviewSessionAccessDenied as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+
+        action = body.get("action")
+        try:
+            camera_system.update_activity()
+            if action == "set_exposure_value":
+                return camera_system.camera_manager.set_exposure_value(body.get("exposure_value"))
+            if action == "set_exposure_mode":
+                return camera_system.camera_manager.set_exposure_mode(
+                    body.get("mode"),
+                    body.get("exposure_time_us"),
+                    body.get("analogue_gain"),
+                )
+            if action == "set_white_balance":
+                return camera_system.camera_manager.set_white_balance(
+                    body.get("mode"),
+                    body.get("preset", "daylight"),
+                    body.get("red_gain"),
+                    body.get("blue_gain"),
+                )
+            raise PreviewControlError("Unknown preview control action")
+        except FocusOperationBusy as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except PreviewControlError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/preview/stop")

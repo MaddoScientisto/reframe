@@ -35,6 +35,10 @@ export function setPreviewFocus(body) {
   return jsonRequest('/api/preview/focus', 'POST', body)
 }
 
+export function setPreviewControls(body) {
+  return jsonRequest('/api/preview/controls', 'POST', body)
+}
+
 export function getCarouselStatus() {
   return request('/api/carousel/status')
 }

@@ -80,6 +80,26 @@ class FakeFocusPicamera:
         return self.metadata.pop(0) if self.metadata else {"AfState": 2, "LensPosition": 4.5}
 
 
+class FakeControlPicamera:
+    camera_controls = {
+        "AeEnable": (False, True, True),
+        "ExposureTime": (100, 1_000_000, 10_000),
+        "AnalogueGain": (1.0, 16.0, 1.0),
+        "AwbEnable": (False, True, True),
+        "AwbMode": (0, 6, 0),
+        "ColourGains": ((0.0, 0.0), (8.0, 8.0), (1.0, 1.0)),
+    }
+
+    def __init__(self):
+        self.control_calls = []
+
+    def capture_metadata(self):
+        return {"ExposureTime": 12000, "AnalogueGain": 2.0}
+
+    def set_controls(self, controls):
+        self.control_calls.append(controls)
+
+
 class LivePreviewTests(unittest.TestCase):
     def test_yuv420_conversion_returns_requested_rgb_size(self):
         try:
@@ -221,6 +241,73 @@ class LivePreviewTests(unittest.TestCase):
         with self.assertRaises(reframe.FocusOperationError):
             manager.set_focus_position(11.0)
 
+    def test_preview_controls_apply_exposure_and_manual_white_balance(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeControlPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._exposure_mode = "auto"
+        manager._white_balance_mode = "auto"
+        manager._white_balance_preset = "daylight"
+        manager._white_balance_gains = {"red": 1.0, "blue": 1.0}
+        manager.settings = {"camera": {"exposure_value": 0}}
+
+        capabilities = manager.get_white_balance_capabilities()
+        self.assertTrue(capabilities["manual_supported"])
+        self.assertEqual(capabilities["supported_presets"], [
+            "auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"
+        ])
+
+        white_balance = manager.set_white_balance("manual", red_gain=1.8, blue_gain=1.4)
+        exposure = manager.set_exposure_value(0.75)
+
+        self.assertEqual(white_balance["colour_gains"], {"red": 1.8, "blue": 1.4})
+        self.assertEqual(exposure["exposure_value"], 0.75)
+        self.assertEqual(manager.picam2.control_calls, [
+            {"AwbEnable": False, "ColourGains": (1.8, 1.4)},
+            {"ExposureValue": 0.75},
+        ])
+
+    def test_exposure_mode_locks_current_values_and_restores_auto(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeControlPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._exposure_mode = "auto"
+        manager._manual_exposure_time_us = None
+        manager._manual_analogue_gain = None
+
+        manual = manager.set_exposure_mode("manual")
+        auto = manager.set_exposure_mode("auto")
+
+        self.assertEqual(manual["exposure_time_us"], 12000)
+        self.assertEqual(manual["analogue_gain"], 2.0)
+        self.assertEqual(auto["exposure_mode"], "auto")
+        self.assertEqual(manager.picam2.control_calls, [
+            {"AeEnable": False, "ExposureTime": 12000, "AnalogueGain": 2.0},
+            {"AeEnable": True},
+        ])
+
+    def test_exposure_value_rejects_manual_mode(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeControlPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._exposure_mode = "manual"
+
+        with self.assertRaises(reframe.PreviewControlError):
+            manager.set_exposure_value(0.5)
+
+    def test_manual_white_balance_rejects_out_of_range_gain(self):
+        manager = object.__new__(reframe.CameraManager)
+        manager.picam2 = FakeControlPicamera()
+        manager._camera_lock = threading.Lock()
+        manager._focus_lock = threading.Lock()
+        manager._white_balance_gains = {"red": 1.0, "blue": 1.0}
+
+        with self.assertRaises(reframe.PreviewControlError):
+            manager.set_white_balance("manual", red_gain=9.0, blue_gain=1.0)
+
     def test_preview_session_can_only_be_stopped_by_owner(self):
         manager = object.__new__(reframe.CameraManager)
         manager._preview_session_lock = threading.Lock()
@@ -265,6 +352,30 @@ class LivePreviewTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"success": True})
         camera_manager.close_preview_session_for_owner.assert_called_once_with("desktop")
+
+    @unittest.skipUnless(TestClient is not None, "FastAPI test dependencies are not installed")
+    def test_preview_controls_route_dispatches_exposure_value(self):
+        camera_manager = Mock()
+        camera_manager.get_preview_telemetry.return_value = {"success": True}
+        camera_manager.set_exposure_value.return_value = {
+            "success": True,
+            "exposure_value": 0.5,
+        }
+        camera_system = SimpleNamespace(camera_manager=camera_manager, update_activity=Mock())
+
+        with patch.object(reframe, "camera_system", camera_system):
+            client = TestClient(reframe._create_fastapi_routes())
+            response = client.post(
+                "/api/preview/controls",
+                json={
+                    "client_id": "desktop",
+                    "action": "set_exposure_value",
+                    "exposure_value": 0.5,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        camera_manager.set_exposure_value.assert_called_once_with(0.5)
 
     @unittest.skipUnless(TestClient is not None, "FastAPI test dependencies are not installed")
     def test_dashboard_forwarding_preserves_bytes_and_closes_upstream(self):

@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
-import { getPreviewTelemetry, setPreviewFocus, stopPreview } from '../api/dashboardApi'
+import { getPreviewTelemetry, setPreviewControls, setPreviewFocus, stopPreview } from '../api/dashboardApi'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -24,12 +24,26 @@ const focusPosition = ref(null)
 const focusDragging = ref(false)
 const focusBusy = ref(false)
 const focusError = ref('')
+const exposureMode = ref('auto')
+const exposureModeBusy = ref(false)
+const exposureValue = ref(0)
+const exposureBusy = ref(false)
+const exposureError = ref('')
+const whiteBalanceMode = ref('auto')
+const whiteBalancePreset = ref('daylight')
+const redGain = ref(1)
+const blueGain = ref(1)
+const whiteBalanceDragging = ref(false)
+const whiteBalanceBusy = ref(false)
+const whiteBalanceError = ref('')
 let telemetryTimer = null
 let telemetryPollToken = 0
 let streamReleasePromise = Promise.resolve()
 
 const focusRange = computed(() => telemetry.value?.focus_range || null)
 const focusModeLabel = computed(() => telemetry.value?.focus_mode || focusMode.value)
+const whiteBalanceCapabilities = computed(() => telemetry.value?.white_balance_capabilities || null)
+const cameraControlBusy = computed(() => focusBusy.value || exposureModeBusy.value || exposureBusy.value || whiteBalanceBusy.value)
 
 watch(
   () => props.open,
@@ -50,8 +64,17 @@ watch(
     telemetry.value = null
     telemetryError.value = ''
     focusError.value = ''
+    exposureMode.value = 'auto'
+    exposureModeBusy.value = false
+    exposureError.value = ''
+    whiteBalanceError.value = ''
     focusMode.value = 'continuous'
     focusPosition.value = null
+    exposureValue.value = 0
+    whiteBalanceMode.value = 'auto'
+    whiteBalancePreset.value = 'daylight'
+    redGain.value = 1
+    blueGain.value = 1
     startTelemetryPolling()
     await nextTick()
     if (!dialogRef.value?.open) dialogRef.value?.showModal()
@@ -81,7 +104,11 @@ function stopStream() {
   telemetry.value = null
   telemetryError.value = ''
   focusError.value = ''
+  exposureModeBusy.value = false
+  exposureError.value = ''
+  whiteBalanceError.value = ''
   focusDragging.value = false
+  whiteBalanceDragging.value = false
   if (clientId) {
     streamReleasePromise = stopPreview(clientId).catch(() => {})
   }
@@ -105,6 +132,18 @@ async function pollTelemetry(token) {
     if (!focusBusy.value && result.focus_mode) focusMode.value = result.focus_mode
     if (!focusDragging.value && result.lens_position !== null && result.lens_position !== undefined) {
       focusPosition.value = result.lens_position
+    }
+    if (!exposureBusy.value && result.exposure_value !== null && result.exposure_value !== undefined) {
+      exposureValue.value = Number(result.exposure_value)
+    }
+    if (!exposureModeBusy.value && result.exposure_mode) exposureMode.value = result.exposure_mode
+    if (!whiteBalanceBusy.value && !whiteBalanceDragging.value) {
+      if (result.white_balance_mode) whiteBalanceMode.value = result.white_balance_mode
+      if (result.white_balance_preset) whiteBalancePreset.value = result.white_balance_preset
+      if (result.colour_gains) {
+        redGain.value = Number(result.colour_gains.red)
+        blueGain.value = Number(result.colour_gains.blue)
+      }
     }
     if (result.frame_age_seconds === null || result.frame_age_seconds > 2.5) {
       streamState.value = streamState.value === 'connecting' ? 'connecting' : 'stalled'
@@ -211,6 +250,88 @@ async function focusCenter() {
   }
 }
 
+async function applyExposureValue() {
+  if (!previewClientId.value || exposureMode.value !== 'auto') return
+  exposureBusy.value = true
+  exposureError.value = ''
+  try {
+    const result = await setPreviewControls({
+      client_id: previewClientId.value,
+      action: 'set_exposure_value',
+      exposure_value: Number(exposureValue.value),
+    })
+    if (result.exposure_value !== undefined) exposureValue.value = Number(result.exposure_value)
+  } catch (error) {
+    exposureError.value = error.message || 'Could not update exposure value'
+    if (telemetry.value?.exposure_value !== undefined) exposureValue.value = Number(telemetry.value.exposure_value)
+  } finally {
+    exposureBusy.value = false
+  }
+}
+
+async function applyExposureMode() {
+  if (!previewClientId.value) return
+  exposureModeBusy.value = true
+  exposureError.value = ''
+  try {
+    const result = await setPreviewControls({
+      client_id: previewClientId.value,
+      action: 'set_exposure_mode',
+      mode: exposureMode.value,
+    })
+    if (result.exposure_mode) exposureMode.value = result.exposure_mode
+  } catch (error) {
+    exposureError.value = error.message || 'Could not change exposure mode'
+    if (telemetry.value?.exposure_mode) exposureMode.value = telemetry.value.exposure_mode
+  } finally {
+    exposureModeBusy.value = false
+  }
+}
+
+function supportedWhiteBalancePreset() {
+  const presets = whiteBalanceCapabilities.value?.supported_presets || []
+  return presets.includes(whiteBalancePreset.value) ? whiteBalancePreset.value : presets[0]
+}
+
+async function applyWhiteBalance() {
+  if (!previewClientId.value) return
+  if (whiteBalanceMode.value === 'preset' && !supportedWhiteBalancePreset()) {
+    whiteBalanceError.value = 'No white-balance preset is available'
+    return
+  }
+  whiteBalanceBusy.value = true
+  whiteBalanceError.value = ''
+  try {
+    const preset = supportedWhiteBalancePreset() || whiteBalancePreset.value
+    const result = await setPreviewControls({
+      client_id: previewClientId.value,
+      action: 'set_white_balance',
+      mode: whiteBalanceMode.value,
+      preset,
+      red_gain: Number(redGain.value),
+      blue_gain: Number(blueGain.value),
+    })
+    if (result.white_balance_mode) whiteBalanceMode.value = result.white_balance_mode
+    if (result.white_balance_preset) whiteBalancePreset.value = result.white_balance_preset
+    if (result.colour_gains) {
+      redGain.value = Number(result.colour_gains.red)
+      blueGain.value = Number(result.colour_gains.blue)
+    }
+  } catch (error) {
+    whiteBalanceError.value = error.message || 'Could not update white balance'
+    if (telemetry.value?.white_balance_mode) whiteBalanceMode.value = telemetry.value.white_balance_mode
+  } finally {
+    whiteBalanceBusy.value = false
+    whiteBalanceDragging.value = false
+  }
+}
+
+function startWhiteBalanceDrag(channel, event) {
+  whiteBalanceDragging.value = true
+  if (channel === 'red') redGain.value = Number(event.target.value)
+  if (channel === 'blue') blueGain.value = Number(event.target.value)
+}
+
 function formatShutter(exposureTime) {
   if (exposureTime === null || exposureTime === undefined || exposureTime <= 0) return '--'
   const seconds = exposureTime / 1_000_000
@@ -277,10 +398,82 @@ onUnmounted(() => {
         <span v-if="telemetry.lux !== undefined"><strong>lux</strong> {{ formatValue(telemetry.lux) }}</span>
       </div>
       <p v-if="telemetryError" class="inline-error">{{ telemetryError }}</p>
+      <div class="preview-camera-controls">
+        <label v-if="telemetry?.exposure_capabilities?.supported">
+          exposure mode
+          <select v-model="exposureMode" :disabled="cameraControlBusy" @change="applyExposureMode">
+            <option value="auto">auto</option>
+            <option v-if="telemetry?.exposure_capabilities?.manual_supported" value="manual">manual (lock current)</option>
+          </select>
+          <span v-if="exposureMode === 'manual'" class="control-value">
+            {{ formatShutter(telemetry.exposure_time_us) }} / {{ formatValue(telemetry.analogue_gain, 'x') }}
+          </span>
+        </label>
+        <label>
+          exposure value
+          <input
+            v-model.number="exposureValue"
+            type="range"
+            min="-2"
+            max="2"
+            step="0.25"
+            :disabled="cameraControlBusy || !telemetry || exposureMode !== 'auto'"
+            @change="applyExposureValue"
+          />
+          <span class="control-value">EV {{ Number(exposureValue).toFixed(2) }}</span>
+        </label>
+        <div v-if="whiteBalanceCapabilities?.supported" class="white-balance-controls">
+          <label>
+            white balance
+            <select v-model="whiteBalanceMode" :disabled="cameraControlBusy" @change="applyWhiteBalance">
+              <option value="auto">auto</option>
+              <option v-if="whiteBalanceCapabilities.preset_supported" value="preset">preset</option>
+              <option v-if="whiteBalanceCapabilities.manual_supported" value="manual">manual gains</option>
+            </select>
+          </label>
+          <label v-if="whiteBalanceMode === 'preset'">
+            preset
+            <select v-model="whiteBalancePreset" :disabled="cameraControlBusy" @change="applyWhiteBalance">
+              <option v-for="preset in whiteBalanceCapabilities.supported_presets" :key="preset" :value="preset">{{ preset }}</option>
+            </select>
+          </label>
+          <template v-if="whiteBalanceMode === 'manual' && whiteBalanceCapabilities.manual_supported">
+            <label>
+              red gain
+              <input
+                type="range"
+                :min="whiteBalanceCapabilities.colour_gains_range.red.min"
+                :max="whiteBalanceCapabilities.colour_gains_range.red.max"
+                :step="whiteBalanceCapabilities.colour_gains_range.red.step"
+                :value="redGain"
+                :disabled="cameraControlBusy"
+                @input="startWhiteBalanceDrag('red', $event)"
+                @change="applyWhiteBalance"
+              />
+              <span class="control-value">{{ formatValue(redGain, 'x') }}</span>
+            </label>
+            <label>
+              blue gain
+              <input
+                type="range"
+                :min="whiteBalanceCapabilities.colour_gains_range.blue.min"
+                :max="whiteBalanceCapabilities.colour_gains_range.blue.max"
+                :step="whiteBalanceCapabilities.colour_gains_range.blue.step"
+                :value="blueGain"
+                :disabled="cameraControlBusy"
+                @input="startWhiteBalanceDrag('blue', $event)"
+                @change="applyWhiteBalance"
+              />
+              <span class="control-value">{{ formatValue(blueGain, 'x') }}</span>
+            </label>
+          </template>
+        </div>
+      </div>
+      <p v-if="exposureError || whiteBalanceError" class="inline-error">{{ exposureError || whiteBalanceError }}</p>
       <div class="focus-controls">
         <label>
           focus mode
-          <select v-model="focusMode" :disabled="focusBusy" @change="applyFocusMode">
+          <select v-model="focusMode" :disabled="cameraControlBusy" @change="applyFocusMode">
             <option value="manual">manual</option>
             <option value="auto">auto</option>
             <option value="continuous">continuous</option>
@@ -294,13 +487,13 @@ onUnmounted(() => {
             :max="focusRange?.max ?? 1"
             :step="focusRange?.step ?? 0.1"
             :value="focusPosition ?? focusRange?.min ?? 0"
-            :disabled="focusMode !== 'manual' || focusBusy || !focusRange"
+            :disabled="focusMode !== 'manual' || cameraControlBusy || !focusRange"
             @input="startFocusDrag"
             @change="applyFocusPosition"
           />
           <span class="focus-position-value">{{ focusPosition === null ? '--' : Number(focusPosition).toFixed(1) }}</span>
         </label>
-        <button class="action-button secondary" type="button" :disabled="focusBusy || !telemetry" @click="focusCenter">
+        <button class="action-button secondary" type="button" :disabled="cameraControlBusy || !telemetry" @click="focusCenter">
           {{ focusBusy ? 'focusing...' : 'focus center' }}
         </button>
       </div>

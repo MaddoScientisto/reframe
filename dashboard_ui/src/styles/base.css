@@ -534,6 +534,44 @@ select {
   text-transform: uppercase;
 }
 
+.preview-camera-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(0, 1.4fr);
+  gap: 14px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--soft-line);
+}
+
+.preview-camera-controls label,
+.white-balance-controls label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.preview-camera-controls input,
+.preview-camera-controls select {
+  width: 100%;
+}
+
+.white-balance-controls {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(120px, 1fr);
+  gap: 12px;
+}
+
+.white-balance-controls > label:first-child {
+  grid-column: 1 / -1;
+}
+
+.control-value {
+  color: var(--ink);
+  font-size: 0.78rem;
+  text-align: right;
+}
+
 .focus-controls {
   display: grid;
   grid-template-columns: minmax(130px, 170px) minmax(180px, 1fr) auto;
@@ -855,6 +893,15 @@ select {
 
   .focus-controls {
     grid-template-columns: 1fr;
+  }
+
+  .preview-camera-controls,
+  .white-balance-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .white-balance-controls > label:first-child {
+    grid-column: auto;
   }
 
   .focus-position-control {

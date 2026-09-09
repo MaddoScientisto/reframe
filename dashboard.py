@@ -108,9 +108,23 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     integer(resolution.get("width"), "camera.resolution.width", 100, 4000)
     integer(resolution.get("height"), "camera.resolution.height", 100, 4000)
     number(camera.get("exposure_value"), "camera.exposure_value", -2, 2)
+    if camera.get("exposure_mode") not in {"auto", "manual"}:
+        raise SettingsValidationError("camera.exposure_mode must be auto or manual")
+    manual_exposure_time_us = camera.get("manual_exposure_time_us")
+    manual_analogue_gain = camera.get("manual_analogue_gain")
+    if manual_exposure_time_us is not None:
+        number(manual_exposure_time_us, "camera.manual_exposure_time_us", 1, 10_000_000)
+    if manual_analogue_gain is not None:
+        number(manual_analogue_gain, "camera.manual_analogue_gain", 1, 64)
     number(camera.get("sharpness"), "camera.sharpness", 0, 10)
     if camera.get("autofocus_mode") not in {0, 1, 2}:
         raise SettingsValidationError("camera.autofocus_mode must be 0, 1, or 2")
+    if camera.get("white_balance_mode") not in {"auto", "preset", "manual"}:
+        raise SettingsValidationError("camera.white_balance_mode must be auto, preset, or manual")
+    text(camera.get("white_balance_preset"), "camera.white_balance_preset", 32)
+    white_balance_gains = section(camera, "white_balance_gains", "camera.white_balance_gains")
+    number(white_balance_gains.get("red"), "camera.white_balance_gains.red", 0, 32)
+    number(white_balance_gains.get("blue"), "camera.white_balance_gains.blue", 0, 32)
 
     processing = section(settings, "processing", "processing")
     number(processing.get("saturation"), "processing.saturation", 0, 2)
@@ -175,8 +189,14 @@ class SettingsManager:
             "camera": {
                 "resolution": {"width": 1200, "height": 800},
                 "exposure_value": 0,
+                "exposure_mode": "auto",
+                "manual_exposure_time_us": None,
+                "manual_analogue_gain": None,
                 "sharpness": 3,
-                "autofocus_mode": 2
+                "autofocus_mode": 2,
+                "white_balance_mode": "auto",
+                "white_balance_preset": "daylight",
+                "white_balance_gains": {"red": 1.0, "blue": 1.0}
             },
             "processing": {
                 "saturation": 0.6,
@@ -1325,6 +1345,81 @@ async def preview_focus(body: Dict[str, Any]):
             except Exception as rollback_error:
                 logging.error("Could not restore focus mode after settings failure: %s", rollback_error)
             raise HTTPException(status_code=500, detail=f"Could not save focus mode: {error}") from error
+
+    return result
+
+@app.post("/api/preview/controls")
+async def preview_controls(body: Dict[str, Any]):
+    """Apply an exposure or white-balance control for the active preview."""
+    if not isinstance(body, dict) or not body.get("client_id"):
+        raise HTTPException(status_code=400, detail="Preview client ID is required")
+
+    previous_settings = settings_manager.load_settings()
+    try:
+        result = await reframe_client.post("/preview/controls", json=body)
+    except httpx.HTTPStatusError as error:
+        try:
+            detail = error.response.json().get("detail", "Preview control failed")
+        except ValueError:
+            detail = "Preview control failed"
+        raise HTTPException(status_code=error.response.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Preview control service unavailable: {error}") from error
+
+    action = body.get("action")
+    camera_update = {}
+    if action == "set_exposure_value":
+        camera_update = {"exposure_value": result.get("exposure_value", body.get("exposure_value"))}
+    elif action == "set_exposure_mode":
+        camera_update = {"exposure_mode": result.get("exposure_mode", body.get("mode"))}
+        if body.get("mode") == "manual":
+            camera_update["manual_exposure_time_us"] = result.get(
+                "exposure_time_us", body.get("exposure_time_us")
+            )
+            camera_update["manual_analogue_gain"] = result.get(
+                "analogue_gain", body.get("analogue_gain")
+            )
+    elif action == "set_white_balance":
+        mode = body.get("mode")
+        camera_update = {"white_balance_mode": mode}
+        if mode == "preset":
+            camera_update["white_balance_preset"] = body.get("preset", "daylight")
+        if mode == "manual":
+            camera_update["white_balance_gains"] = {
+                "red": result.get("colour_gains", {}).get("red", body.get("red_gain")),
+                "blue": result.get("colour_gains", {}).get("blue", body.get("blue_gain")),
+            }
+    else:
+        raise HTTPException(status_code=400, detail="Unknown preview control action")
+
+    try:
+        if not settings_manager.save_settings({"camera": camera_update}):
+            raise RuntimeError("Could not save camera control")
+    except Exception as error:
+        previous_camera = previous_settings.get("camera", {})
+        rollback = {
+            "client_id": body["client_id"],
+            "action": action,
+        }
+        if action == "set_exposure_value":
+            rollback["exposure_value"] = previous_camera.get("exposure_value", 0)
+        elif action == "set_exposure_mode":
+            rollback["mode"] = previous_camera.get("exposure_mode", "auto")
+            if rollback["mode"] == "manual":
+                rollback["exposure_time_us"] = previous_camera.get("manual_exposure_time_us")
+                rollback["analogue_gain"] = previous_camera.get("manual_analogue_gain")
+        else:
+            rollback.update({
+                "mode": previous_camera.get("white_balance_mode", "auto"),
+                "preset": previous_camera.get("white_balance_preset", "daylight"),
+                "red_gain": previous_camera.get("white_balance_gains", {}).get("red", 1.0),
+                "blue_gain": previous_camera.get("white_balance_gains", {}).get("blue", 1.0),
+            })
+        try:
+            await reframe_client.post("/preview/controls", json=rollback)
+        except Exception as rollback_error:
+            logging.error("Could not restore preview control after settings failure: %s", rollback_error)
+        raise HTTPException(status_code=500, detail=f"Could not save preview control: {error}") from error
 
     return result
 
