@@ -132,6 +132,11 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     number(white_balance_gains.get("red"), "camera.white_balance_gains.red", 0, 32)
     number(white_balance_gains.get("blue"), "camera.white_balance_gains.blue", 0, 32)
 
+    metadata = section(settings, "metadata", "metadata")
+    text(metadata.get("artist"), "metadata.artist", 128)
+    text(metadata.get("copyright"), "metadata.copyright", 128)
+    text(metadata.get("image_description"), "metadata.image_description", 1024)
+
     processing = section(settings, "processing", "processing")
     number(processing.get("saturation"), "processing.saturation", 0, 2)
     number(processing.get("brightness_factor"), "processing.brightness_factor", 0.1, 3)
@@ -203,6 +208,11 @@ class SettingsManager:
                 "white_balance_mode": "auto",
                 "white_balance_preset": "daylight",
                 "white_balance_gains": {"red": 1.0, "blue": 1.0}
+            },
+            "metadata": {
+                "artist": "",
+                "copyright": "",
+                "image_description": "",
             },
             "processing": {
                 "saturation": 0.6,

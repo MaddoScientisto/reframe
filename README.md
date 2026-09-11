@@ -97,6 +97,7 @@ reframe/
     ├── software-setup.md
     ├── hardware-porting.md
     ├── dashboard-extensions.md
+    ├── exif-metadata.md
     └── images/
 ```
 

@@ -123,18 +123,101 @@ class PhotoPreviewTests(unittest.TestCase):
     def test_capture_metadata_is_written_to_jpeg_exif(self):
         image = Image.new("RGB", (20, 10), "white")
         output_path = Path(self.temp_dir.name) / "captured.jpg"
+        capture_time = datetime(2026, 9, 11, 13, 12, 45, 139352, tzinfo=timezone.utc)
         reframe.ImageProcessor.save_image_with_metadata(
             image,
             str(output_path),
-            metadata={"ExposureTime": 20_000, "AnalogueGain": 2.0},
+            metadata={"ExposureTime": 20_000, "AnalogueGain": 2.0, "FNumber": 2.8},
+            capture_time=capture_time,
+            photo_metadata={
+                "artist": "Maddo",
+                "copyright": "Maddo 2026",
+                "image_description": "ReFrame test capture",
+            },
+            camera_identity={
+                "make": "Raspberry Pi",
+                "model": "ReFrame Camera",
+                "hardware_model": "Raspberry Pi Camera Module 3",
+            },
+            operating_system="Test OS",
         )
 
         with Image.open(output_path) as saved:
             exif = saved.getexif()
+            exif_data = exif.get_ifd(reframe.EXIF_EXIF_IFD_TAG)
             self.assertEqual(exif.get(reframe.EXIF_ORIENTATION_TAG), 1)
-            self.assertEqual(exif.get(reframe.EXIF_SOFTWARE_TAG), "reFrame")
-            self.assertAlmostEqual(float(exif.get(reframe.EXIF_EXPOSURE_TIME_TAG)), 0.02)
-            self.assertEqual(exif.get(reframe.EXIF_ISO_TAG), 200)
+            self.assertEqual(exif.get(reframe.EXIF_MAKE_TAG), "Raspberry Pi")
+            self.assertEqual(exif.get(reframe.EXIF_MODEL_TAG), "ReFrame Camera")
+            self.assertEqual(exif.get(reframe.EXIF_SOFTWARE_TAG), "reFrame (Test OS)")
+            self.assertEqual(exif.get(reframe.EXIF_ARTIST_TAG), "Maddo")
+            self.assertEqual(exif.get(reframe.EXIF_COPYRIGHT_TAG), "Maddo 2026")
+            self.assertEqual(exif.get(reframe.EXIF_IMAGE_DESCRIPTION_TAG), "ReFrame test capture")
+            self.assertEqual(exif_data.get(reframe.EXIF_LENS_MAKE_TAG), "Raspberry Pi")
+            self.assertEqual(exif_data.get(reframe.EXIF_LENS_MODEL_TAG), "Raspberry Pi Camera Module 3")
+            self.assertEqual(exif_data.get(reframe.EXIF_DATETIME_ORIGINAL_TAG), "2026:09:11 13:12:45")
+            self.assertEqual(exif_data.get(reframe.EXIF_SUBSEC_TIME_ORIGINAL_TAG), "139352")
+            self.assertEqual(exif_data.get(reframe.EXIF_OFFSET_TIME_ORIGINAL_TAG), "+00:00")
+            self.assertAlmostEqual(float(exif_data.get(reframe.EXIF_EXPOSURE_TIME_TAG)), 0.02)
+            self.assertEqual(exif_data.get(reframe.EXIF_ISO_TAG), 200)
+            self.assertAlmostEqual(float(exif_data.get(reframe.EXIF_FNUMBER_TAG)), 2.8, places=2)
+
+    def test_dithered_png_handles_source_without_interop_ifd(self):
+        source_path = Path(self.temp_dir.name) / "source.jpg"
+        output_path = Path(self.temp_dir.name) / "dithered.png"
+        source = Image.new("RGB", (20, 10), "white")
+        reframe.ImageProcessor.save_image_with_metadata(
+            source,
+            str(source_path),
+            metadata={},
+            capture_time=datetime(2026, 9, 11, 13, 12, 45, tzinfo=timezone.utc),
+        )
+
+        with Image.open(source_path) as saved_source:
+            rendered = reframe.ImageProcessor.render_photo_with_settings(
+                str(source_path),
+                {"dithering_method": "ordered", "gb_color_palette": "blue_yellow"},
+            )
+            reframe.ImageProcessor.save_dithered_image(
+                rendered,
+                str(output_path),
+                source_image=saved_source,
+                dithering_method="ordered",
+                gb_color_palette="blue_yellow",
+            )
+            rendered.close()
+
+        with Image.open(output_path) as saved_dithered:
+            self.assertEqual(saved_dithered.info.get("reframe:dithering_method"), "ordered")
+            self.assertEqual(saved_dithered.getexif().get(reframe.EXIF_ORIENTATION_TAG), 1)
+
+    def test_gallery_rotation_changes_orientation_without_changing_pixels(self):
+        original = Image.new("RGB", (4, 3))
+        original.putdata([
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (40, 40, 40), (80, 80, 80),
+            (120, 120, 120), (160, 160, 160), (200, 200, 200), (240, 240, 240),
+        ])
+        original_path = Path(self.temp_dir.name) / "original.jpg"
+        original.save(original_path, format="JPEG", quality=100)
+        with Image.open(original_path) as saved_original:
+            original_pixels = list(saved_original.convert("RGB").getdata())
+            preview = saved_original.copy()
+        encoded_output = BytesIO()
+        preview.save(encoded_output, format="PNG")
+
+        result = reframe.ImageProcessor.save_dithered_preview_by_id(
+            "original",
+            encoded_png=base64.b64encode(encoded_output.getvalue()).decode("ascii"),
+            rotation=3,
+            photos_path=self.temp_dir.name,
+            output_path=self.temp_dir.name,
+        )
+
+        self.assertTrue(result["success"])
+        with Image.open(original_path) as saved_original, Image.open(Path(self.temp_dir.name) / "original_dithered.png") as dithered:
+            self.assertEqual(list(saved_original.convert("RGB").getdata()), original_pixels)
+            self.assertEqual(list(dithered.convert("RGB").getdata()), list(preview.convert("RGB").getdata()))
+            self.assertEqual(dithered.getexif().get(reframe.EXIF_ORIENTATION_TAG), 8)
 
     def test_dithered_metadata_exposes_scalar_capture_time_and_sensor_metadata(self):
         image = Image.new("RGB", (20, 10), "white")
@@ -154,7 +237,10 @@ class PhotoPreviewTests(unittest.TestCase):
             "LensPosition": 1.0,
             "SensorTimestamp": 266225241000,
         })
-        self.assertEqual(metadata["capture_metadata"]["schema"], 1)
+        self.assertEqual(metadata["capture_metadata"]["schema"], 2)
+        self.assertEqual(metadata["exif_metadata"]["camera"]["model"], "ReFrame Camera")
+        self.assertEqual(metadata["exif_metadata"]["dates"]["original"], "2026:09:11 13:12:45")
+        self.assertAlmostEqual(metadata["exif_metadata"]["technical"]["exposure_time"], 0.02)
 
 
 if __name__ == "__main__":

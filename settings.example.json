@@ -17,6 +17,11 @@
       "blue": 1.0
     }
   },
+  "metadata": {
+    "artist": "",
+    "copyright": "",
+    "image_description": ""
+  },
   "processing": {
     "saturation": 0.6,
     "brightness_factor": 1.1,

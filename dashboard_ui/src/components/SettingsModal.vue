@@ -38,6 +38,11 @@ function defaultSettings() {
       white_balance_preset: 'daylight',
       white_balance_gains: { red: 1, blue: 1 },
     },
+    metadata: {
+      artist: '',
+      copyright: '',
+      image_description: '',
+    },
     processing: {
       saturation: 0.6,
       brightness_factor: 1.1,
@@ -211,6 +216,14 @@ function isDownloadBuilding(status) {
               <option :value="2">continuous</option>
             </select>
           </label>
+        </section>
+
+        <section class="settings-section">
+          <h3>photo metadata</h3>
+          <label class="setting-row">artist / author <input v-model.trim="draft.metadata.artist" type="text" maxlength="128" placeholder="optional" /></label>
+          <label class="setting-row">copyright <input v-model.trim="draft.metadata.copyright" type="text" maxlength="128" placeholder="optional" /></label>
+          <label class="setting-row">image description <textarea v-model.trim="draft.metadata.image_description" maxlength="1024" rows="3" placeholder="optional" /></label>
+          <p class="setting-help">New captures store this information in standard EXIF fields.</p>
         </section>
 
         <section class="settings-section">

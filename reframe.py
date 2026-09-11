@@ -11,6 +11,7 @@ import socket
 import base64
 import random
 import hashlib
+import platform
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -106,24 +107,56 @@ DISPLAY_PANEL_HEIGHT = 600
 DISPLAY_IMAGE_SIZE = (DISPLAY_IMAGE_WIDTH, DISPLAY_IMAGE_HEIGHT)
 DISPLAY_PANEL_SIZE = (DISPLAY_PANEL_WIDTH, DISPLAY_PANEL_HEIGHT)
 EXIF_ORIENTATION_TAG = 274
+EXIF_IMAGE_DESCRIPTION_TAG = 270
+EXIF_MAKE_TAG = 271
+EXIF_MODEL_TAG = 272
+EXIF_EXIF_IFD_TAG = 34665
+EXIF_GPS_IFD_TAG = 34853
+EXIF_INTEROP_IFD_TAG = 40965
+EXIF_X_RESOLUTION_TAG = 282
+EXIF_Y_RESOLUTION_TAG = 283
+EXIF_RESOLUTION_UNIT_TAG = 296
 EXIF_SOFTWARE_TAG = 305
 EXIF_DATETIME_TAG = 306
+EXIF_ARTIST_TAG = 315
+EXIF_COPYRIGHT_TAG = 33432
+EXIF_EXIF_VERSION_TAG = 36864
 EXIF_DATETIME_ORIGINAL_TAG = 36867
 EXIF_DATETIME_DIGITIZED_TAG = 36868
+EXIF_COMPONENTS_CONFIGURATION_TAG = 37121
 EXIF_OFFSET_TIME_TAG = 36880
 EXIF_OFFSET_TIME_ORIGINAL_TAG = 36881
 EXIF_OFFSET_TIME_DIGITIZED_TAG = 36882
 EXIF_EXPOSURE_TIME_TAG = 33434
+EXIF_FNUMBER_TAG = 33437
 EXIF_ISO_TAG = 34855
+EXIF_EXPOSURE_PROGRAM_TAG = 34850
+EXIF_SHUTTER_SPEED_VALUE_TAG = 37377
+EXIF_APERTURE_VALUE_TAG = 37378
 EXIF_EXPOSURE_BIAS_TAG = 37380
+EXIF_MAX_APERTURE_VALUE_TAG = 37381
+EXIF_METERING_MODE_TAG = 37383
 EXIF_SUBJECT_DISTANCE_TAG = 37382
 EXIF_LIGHT_SOURCE_TAG = 37384
+EXIF_FLASH_TAG = 37385
+EXIF_FOCAL_LENGTH_TAG = 37386
 EXIF_WHITE_BALANCE_TAG = 41987
 EXIF_USER_COMMENT_TAG = 37510
+EXIF_SUBSEC_TIME_TAG = 37520
+EXIF_SUBSEC_TIME_ORIGINAL_TAG = 37521
+EXIF_SUBSEC_TIME_DIGITIZED_TAG = 37522
 EXIF_PIXEL_X_TAG = 40962
 EXIF_PIXEL_Y_TAG = 40963
+EXIF_COLOR_SPACE_TAG = 40961
+EXIF_CUSTOM_RENDERED_TAG = 41985
+EXIF_EXPOSURE_MODE_TAG = 41986
+EXIF_LENS_MAKE_TAG = 42035
+EXIF_LENS_MODEL_TAG = 42036
 ROTATION_TO_EXIF = {0: 1, 1: 6, 2: 3, 3: 8}
 EXIF_TO_ROTATION = {value: key for key, value in ROTATION_TO_EXIF.items()}
+DEFAULT_CAMERA_MAKE = "Raspberry Pi"
+DEFAULT_CAMERA_MODEL = "ReFrame Camera"
+DEFAULT_CAMERA_HARDWARE = "Raspberry Pi Camera Module 3"
 BUTTON_POLL_INTERVAL_SECONDS = 0.025
 LIVE_PREVIEW_MAX_SIZE = (640, 480)
 LIVE_PREVIEW_FPS = 5
@@ -565,6 +598,13 @@ class CameraManager:
             carousel.setdefault("interval_seconds", 30)
             carousel.setdefault("photo_ids", [])
             carousel.setdefault("shuffle", False)
+            metadata = settings.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                settings["metadata"] = metadata
+            metadata.setdefault("artist", "")
+            metadata.setdefault("copyright", "")
+            metadata.setdefault("image_description", "")
             camera = settings.get("camera")
             if not isinstance(camera, dict):
                 camera = {}
@@ -588,6 +628,11 @@ class CameraManager:
                     "white_balance_mode": "auto",
                     "white_balance_preset": "daylight",
                     "white_balance_gains": {"red": 1.0, "blue": 1.0}
+                },
+                "metadata": {
+                    "artist": "",
+                    "copyright": "",
+                    "image_description": "",
                 },
                 "processing": {
                     "saturation": 0.6,
@@ -1406,6 +1451,31 @@ class CameraManager:
             size = (resolution.get("width", 1200), resolution.get("height", 800))
         return int(size[0]), int(size[1])
 
+    def exif_metadata_context(self):
+        """Return configured photo metadata and the detected camera identity."""
+        camera_settings = self.settings.get("camera", {})
+        camera_properties = getattr(self.picam2, "camera_properties", {}) or {}
+        sensor_model = str(
+            camera_properties.get("Model") or camera_properties.get("ModelName") or ""
+        ).strip()
+        hardware_model = camera_settings.get("hardware_model")
+        if not hardware_model:
+            hardware_model = {
+                "imx708": DEFAULT_CAMERA_HARDWARE,
+            }.get(sensor_model.lower(), sensor_model or DEFAULT_CAMERA_HARDWARE)
+        camera_identity = {
+            "make": camera_settings.get("make") or DEFAULT_CAMERA_MAKE,
+            "model": camera_settings.get("model") or DEFAULT_CAMERA_MODEL,
+            "hardware_model": hardware_model,
+        }
+        if sensor_model:
+            camera_identity["sensor_model"] = sensor_model
+        return (
+            dict(self.settings.get("metadata", {})),
+            camera_identity,
+            platform.platform(),
+        )
+
     def _center_focus_window(self):
         width, height = self._sensor_size()
         window_width = max(2, width // 4)
@@ -1588,29 +1658,59 @@ class ImageProcessor:
         return json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
 
     @staticmethod
+    def _normalize_rotation(rotation):
+        try:
+            return int(rotation) % 4
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def _capture_exif_values(capture_time):
-        resolved = resolve_capture_timestamp({}, capture_time).astimezone()
+        resolved = resolve_capture_timestamp({}, capture_time)
         timestamp = resolved.strftime("%Y:%m:%d %H:%M:%S")
         offset = resolved.strftime("%z")
         offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else None
-        return resolved, timestamp, offset
+        subsecond = f"{resolved.microsecond:06d}".rstrip("0") or "0"
+        return resolved, timestamp, offset, subsecond
+
+    @staticmethod
+    def _exif_value(image, tag, default=None):
+        try:
+            exif = image.getexif()
+            value = exif.get(tag)
+            if value is not None:
+                return value
+            return exif.get_ifd(EXIF_EXIF_IFD_TAG).get(tag, default)
+        except (AttributeError, TypeError, ValueError):
+            return default
 
     @staticmethod
     def _capture_time_from_source(image):
         """Read the stored capture timestamp when reprocessing an original."""
         try:
-            exif = image.getexif()
-            timestamp = exif.get(EXIF_DATETIME_ORIGINAL_TAG) or exif.get(EXIF_DATETIME_TAG)
+            timestamp = ImageProcessor._exif_value(image, EXIF_DATETIME_ORIGINAL_TAG)
+            timestamp = timestamp or ImageProcessor._exif_value(image, EXIF_DATETIME_TAG)
+            if not timestamp:
+                timestamp = ImageProcessor._custom_metadata_from_source(image).get("capture_time")
             if not timestamp:
                 return None
-            resolved = datetime.strptime(str(timestamp), "%Y:%m:%d %H:%M:%S")
-            offset = exif.get(EXIF_OFFSET_TIME_ORIGINAL_TAG) or exif.get(EXIF_OFFSET_TIME_TAG)
+            try:
+                resolved = datetime.strptime(str(timestamp), "%Y:%m:%d %H:%M:%S")
+            except ValueError:
+                resolved = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            offset = ImageProcessor._exif_value(image, EXIF_OFFSET_TIME_ORIGINAL_TAG)
+            offset = offset or ImageProcessor._exif_value(image, EXIF_OFFSET_TIME_TAG)
             if offset:
                 sign = 1 if str(offset).startswith("+") else -1
                 hours, minutes = str(offset)[1:].split(":", 1)
                 resolved = resolved.replace(
                     tzinfo=timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
                 )
+            subsecond = ImageProcessor._exif_value(image, EXIF_SUBSEC_TIME_ORIGINAL_TAG)
+            subsecond = subsecond or ImageProcessor._exif_value(image, EXIF_SUBSEC_TIME_TAG)
+            if subsecond is not None:
+                digits = "".join(char for char in str(subsecond) if char.isdigit())[:6].ljust(6, "0")
+                resolved = resolved.replace(microsecond=int(digits))
             return resolve_capture_timestamp({}, resolved)
         except (AttributeError, TypeError, ValueError):
             return None
@@ -1638,22 +1738,130 @@ class ImageProcessor:
         return ImageProcessor._rational(exposure_seconds)
 
     @staticmethod
-    def _custom_capture_metadata(metadata):
-        if not isinstance(metadata, dict):
-            return {"schema": 1, "sensor": {}}
+    def _decode_user_comment(value):
+        if not isinstance(value, (bytes, bytearray)):
+            return value if isinstance(value, str) else None
+        raw = bytes(value)
+        if raw.startswith(b"UNICODE\x00"):
+            payload = raw[8:]
+            if payload.lstrip().startswith((b"{", b"[")):
+                return payload.decode("utf-8", errors="replace")
+            try:
+                return payload.decode("utf-16-be")
+            except UnicodeDecodeError:
+                return payload.decode("utf-8", errors="replace")
+        if raw.startswith((b"ASCII\x00\x00\x00", b"JIS\x00\x00\x00\x00\x00")):
+            return raw[8:].decode("utf-8", errors="replace")
+        return raw.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _custom_metadata_from_source(image):
+        try:
+            raw_comment = ImageProcessor._decode_user_comment(
+                ImageProcessor._exif_value(image, EXIF_USER_COMMENT_TAG)
+            )
+            parsed = json.loads(raw_comment) if raw_comment else {}
+            return parsed if isinstance(parsed, dict) else {}
+        except (AttributeError, TypeError, ValueError):
+            return {}
+
+    @staticmethod
+    def _photo_metadata_from_source(image):
+        try:
+            exif = image.getexif()
+            custom = ImageProcessor._custom_metadata_from_source(image)
+            return {
+                "artist": exif.get(EXIF_ARTIST_TAG) or custom.get("artist", ""),
+                "copyright": exif.get(EXIF_COPYRIGHT_TAG) or custom.get("copyright", ""),
+                "image_description": exif.get(EXIF_IMAGE_DESCRIPTION_TAG) or custom.get("image_description", ""),
+            }
+        except (AttributeError, TypeError):
+            return {}
+
+    @staticmethod
+    def _camera_identity_from_source(image):
+        try:
+            exif = image.getexif()
+            custom = ImageProcessor._custom_metadata_from_source(image)
+            camera = custom.get("camera", {})
+            return {
+                "make": exif.get(EXIF_MAKE_TAG) or camera.get("make", ""),
+                "model": exif.get(EXIF_MODEL_TAG) or camera.get("model", ""),
+                "hardware_model": ImageProcessor._exif_value(image, EXIF_LENS_MODEL_TAG)
+                or camera.get("hardware_model", ""),
+            }
+        except (AttributeError, TypeError):
+            return {}
+
+    @staticmethod
+    def _custom_capture_metadata(
+        metadata,
+        photo_metadata=None,
+        camera_identity=None,
+        operating_system=None,
+    ):
+        metadata = metadata if isinstance(metadata, dict) else {}
         standard_keys = {
             "ExposureTime", "AnalogueGain", "ExposureValue", "ExposureCompensation",
             "ExposureCompensationValue", "AwbEnable", "AwbMode", "SubjectDistance",
-            "CalibratedFocusDistance", "CaptureTimestamp", "capture_time",
+            "CalibratedFocusDistance", "CaptureTimestamp", "capture_time", "FNumber",
+            "Aperture", "ApertureValue", "LensFocalLength", "FocalLength", "IsoCalibration",
         }
-        sensor = {
-            key: value for key, value in metadata.items()
-            if key not in standard_keys and key in {
-                "SensorTimestamp", "FrameDuration", "LensPosition", "AfState", "ColourGains",
-                "AfMode", "AwbMode", "AwbEnable",
+        sensor = {key: value for key, value in metadata.items() if key not in standard_keys}
+        photo_metadata = photo_metadata if isinstance(photo_metadata, dict) else {}
+        camera_identity = camera_identity if isinstance(camera_identity, dict) else {}
+        custom = {
+            "schema": 2,
+            "camera": camera_identity,
+            "operating_system": operating_system or platform.platform(),
+            "sensor": sensor,
+        }
+        for key in ("artist", "copyright", "image_description"):
+            value = photo_metadata.get(key)
+            if isinstance(value, str) and value:
+                custom[key] = value
+        return custom
+
+    @staticmethod
+    def _capture_metadata_envelope(
+        metadata,
+        source_image,
+        photo_metadata,
+        camera_identity,
+        operating_system,
+        capture_time,
+        rotation,
+    ):
+        source_custom_metadata = (
+            ImageProcessor._custom_metadata_from_source(source_image)
+            if source_image is not None else {}
+        )
+        if source_image is not None and not camera_identity:
+            camera_identity = ImageProcessor._camera_identity_from_source(source_image)
+        if source_image is not None and not photo_metadata:
+            photo_metadata = ImageProcessor._photo_metadata_from_source(source_image)
+        if operating_system is None:
+            operating_system = source_custom_metadata.get("operating_system")
+        if not camera_identity:
+            camera_identity = {
+                "make": DEFAULT_CAMERA_MAKE,
+                "model": DEFAULT_CAMERA_MODEL,
+                "hardware_model": DEFAULT_CAMERA_HARDWARE,
             }
-        }
-        return {"schema": 1, "sensor": sensor}
+        custom_metadata = ImageProcessor._custom_capture_metadata(
+            metadata,
+            photo_metadata=photo_metadata,
+            camera_identity=camera_identity,
+            operating_system=operating_system,
+        )
+        for key, value in source_custom_metadata.items():
+            if key not in custom_metadata or not custom_metadata[key]:
+                custom_metadata[key] = value
+        if not metadata and isinstance(source_custom_metadata.get("sensor"), dict):
+            custom_metadata["sensor"] = source_custom_metadata["sensor"]
+        custom_metadata["capture_time"] = capture_time.isoformat()
+        custom_metadata["orientation"] = ROTATION_TO_EXIF[rotation]
+        return custom_metadata
 
     @staticmethod
     def _exif_for_image(
@@ -1662,37 +1870,118 @@ class ImageProcessor:
         rotation=0,
         metadata=None,
         capture_time=None,
+        photo_metadata=None,
+        camera_identity=None,
+        operating_system=None,
+        modified_time=None,
+        processing_metadata=None,
     ):
+        Image, _ = _lazy_import_pil()
         metadata = metadata if isinstance(metadata, dict) else {}
-        exif = image.getexif()
-        if source_image is not None:
-            try:
-                for tag, value in source_image.getexif().items():
-                    exif[tag] = value
-            except (AttributeError, TypeError):
-                pass
+        rotation = ImageProcessor._normalize_rotation(rotation)
+        try:
+            exif = Image.Exif()
+        except AttributeError:
+            exif = image.getexif()
+        metadata_source = source_image if source_image is not None else image
+        try:
+            source_exif = metadata_source.getexif()
+            for tag, value in source_exif.items():
+                if tag in (EXIF_EXIF_IFD_TAG, EXIF_GPS_IFD_TAG, EXIF_INTEROP_IFD_TAG):
+                    continue
+                exif[tag] = value
+            for ifd_tag in (EXIF_EXIF_IFD_TAG, EXIF_GPS_IFD_TAG, EXIF_INTEROP_IFD_TAG):
+                try:
+                    source_ifd = source_exif.get_ifd(ifd_tag)
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    continue
+                if source_ifd:
+                    try:
+                        exif.get_ifd(ifd_tag).update(source_ifd)
+                    except (AttributeError, KeyError, TypeError, ValueError):
+                        continue
+        except (AttributeError, TypeError, ValueError):
+            pass
 
+        exif_data = exif.get_ifd(EXIF_EXIF_IFD_TAG)
         exif[EXIF_ORIENTATION_TAG] = ROTATION_TO_EXIF[rotation]
-        exif[EXIF_SOFTWARE_TAG] = "reFrame"
-        resolved, timestamp, offset = ImageProcessor._capture_exif_values(
-            capture_time or metadata.get("CaptureTimestamp") or metadata.get("capture_time")
+        camera_identity = camera_identity if isinstance(camera_identity, dict) else {}
+        photo_metadata = photo_metadata if isinstance(photo_metadata, dict) else {}
+        source_software = exif.get(EXIF_SOFTWARE_TAG) if source_image is not None else None
+        preserve_source_software = source_image is not None and operating_system is None
+        source_custom_metadata = (
+            ImageProcessor._custom_metadata_from_source(source_image)
+            if source_image is not None else {}
         )
-        exif[EXIF_DATETIME_TAG] = timestamp
-        exif[EXIF_DATETIME_ORIGINAL_TAG] = timestamp
-        exif[EXIF_DATETIME_DIGITIZED_TAG] = timestamp
+        if source_image is not None and not camera_identity:
+            camera_identity = ImageProcessor._camera_identity_from_source(source_image)
+        if source_image is not None and not photo_metadata:
+            photo_metadata = ImageProcessor._photo_metadata_from_source(source_image)
+        if operating_system is None:
+            operating_system = source_custom_metadata.get("operating_system")
+        make = camera_identity.get("make") or DEFAULT_CAMERA_MAKE
+        model = camera_identity.get("model") or DEFAULT_CAMERA_MODEL
+        hardware_model = camera_identity.get("hardware_model") or DEFAULT_CAMERA_HARDWARE
+        operating_system = operating_system or platform.platform()
+        resolved_capture_time = capture_time
+        if resolved_capture_time is None and source_image is not None:
+            resolved_capture_time = ImageProcessor._capture_time_from_source(source_image)
+        resolved, timestamp, offset, subsecond = ImageProcessor._capture_exif_values(
+            resolved_capture_time or metadata.get("CaptureTimestamp") or metadata.get("capture_time")
+        )
+        modified, modified_timestamp, modified_offset, modified_subsecond = ImageProcessor._capture_exif_values(
+            modified_time or datetime.now().astimezone()
+        )
+        exif[EXIF_MAKE_TAG] = str(make)
+        exif[EXIF_MODEL_TAG] = str(model)
+        exif_data[EXIF_LENS_MAKE_TAG] = str(make)
+        exif_data[EXIF_LENS_MODEL_TAG] = str(hardware_model)
+        exif[EXIF_SOFTWARE_TAG] = (
+            str(source_software)
+            if source_software and preserve_source_software
+            else f"reFrame ({operating_system})"
+        )
+        exif[EXIF_ORIENTATION_TAG] = ROTATION_TO_EXIF[rotation]
+        exif[EXIF_DATETIME_TAG] = modified_timestamp
+        exif_data[EXIF_DATETIME_ORIGINAL_TAG] = timestamp
+        exif_data[EXIF_DATETIME_DIGITIZED_TAG] = timestamp
+        if modified_offset:
+            exif_data[EXIF_OFFSET_TIME_TAG] = modified_offset
         if offset:
-            exif[EXIF_OFFSET_TIME_TAG] = offset
-            exif[EXIF_OFFSET_TIME_ORIGINAL_TAG] = offset
-            exif[EXIF_OFFSET_TIME_DIGITIZED_TAG] = offset
+            exif_data[EXIF_OFFSET_TIME_ORIGINAL_TAG] = offset
+            exif_data[EXIF_OFFSET_TIME_DIGITIZED_TAG] = offset
+        exif_data[EXIF_SUBSEC_TIME_TAG] = modified_subsecond
+        exif_data[EXIF_SUBSEC_TIME_ORIGINAL_TAG] = subsecond
+        exif_data[EXIF_SUBSEC_TIME_DIGITIZED_TAG] = subsecond
+        exif_data[EXIF_EXIF_VERSION_TAG] = b"0231"
+        exif_data[EXIF_COMPONENTS_CONFIGURATION_TAG] = b"\x01\x02\x03\x00"
+        exif[EXIF_X_RESOLUTION_TAG] = (72, 1)
+        exif[EXIF_Y_RESOLUTION_TAG] = (72, 1)
+        exif[EXIF_RESOLUTION_UNIT_TAG] = 2
+        exif_data[EXIF_COLOR_SPACE_TAG] = 1
+        exif_data[EXIF_PIXEL_X_TAG] = int(image.width)
+        exif_data[EXIF_PIXEL_Y_TAG] = int(image.height)
+
+        artist = photo_metadata.get("artist")
+        copyright_text = photo_metadata.get("copyright")
+        image_description = photo_metadata.get("image_description")
+        if artist:
+            exif[EXIF_ARTIST_TAG] = str(artist)
+        if copyright_text:
+            exif[EXIF_COPYRIGHT_TAG] = str(copyright_text)
+        if image_description:
+            exif[EXIF_IMAGE_DESCRIPTION_TAG] = str(image_description)
 
         exposure_time = ImageProcessor._exposure_time_rational(metadata.get("ExposureTime"))
         if exposure_time and exposure_time[0] > 0:
-            exif[EXIF_EXPOSURE_TIME_TAG] = exposure_time
+            exif_data[EXIF_EXPOSURE_TIME_TAG] = exposure_time
+            shutter_speed = -math.log2(float(exposure_time[0]) / float(exposure_time[1]))
+            exif_data[EXIF_SHUTTER_SPEED_VALUE_TAG] = ImageProcessor._rational(shutter_speed, 1000)
         analogue_gain = metadata.get("AnalogueGain")
         iso_calibration = metadata.get("IsoCalibration", metadata.get("iso_calibration", 100))
         try:
             if analogue_gain is not None and float(analogue_gain) > 0 and float(iso_calibration) > 0:
-                exif[EXIF_ISO_TAG] = max(1, round(float(analogue_gain) * float(iso_calibration)))
+                exif_data[EXIF_ISO_TAG] = max(1, round(float(analogue_gain) * float(iso_calibration)))
         except (TypeError, ValueError):
             pass
 
@@ -1701,24 +1990,48 @@ class ImageProcessor:
             exposure_bias = metadata.get("ExposureCompensationValue")
         exposure_bias_value = ImageProcessor._rational(exposure_bias, 1000)
         if exposure_bias_value:
-            exif[EXIF_EXPOSURE_BIAS_TAG] = exposure_bias_value
+            exif_data[EXIF_EXPOSURE_BIAS_TAG] = exposure_bias_value
+
+        f_number = metadata.get("FNumber", metadata.get("Aperture"))
+        f_number_value = ImageProcessor._rational(f_number, 100)
+        if f_number_value and f_number_value[0] > 0:
+            exif_data[EXIF_FNUMBER_TAG] = f_number_value
+            aperture_value = 2 * math.log2(float(f_number_value[0]) / float(f_number_value[1]))
+            exif_data[EXIF_APERTURE_VALUE_TAG] = ImageProcessor._rational(aperture_value, 1000)
+
+        focal_length = metadata.get("LensFocalLength", metadata.get("FocalLength"))
+        focal_length_value = ImageProcessor._rational(focal_length, 100)
+        if focal_length_value and focal_length_value[0] > 0:
+            exif_data[EXIF_FOCAL_LENGTH_TAG] = focal_length_value
+
+        ae_enabled = metadata.get("AeEnable")
+        if isinstance(ae_enabled, bool):
+            exif_data[EXIF_EXPOSURE_PROGRAM_TAG] = 2 if ae_enabled else 1
+            exif_data[EXIF_EXPOSURE_MODE_TAG] = 0 if ae_enabled else 1
+        exif_data[EXIF_FLASH_TAG] = 0
 
         awb_mode = metadata.get("AwbMode")
         if isinstance(metadata.get("AwbEnable"), bool):
-            exif[EXIF_WHITE_BALANCE_TAG] = 0 if metadata["AwbEnable"] else 1
+            exif_data[EXIF_WHITE_BALANCE_TAG] = 0 if metadata["AwbEnable"] else 1
         if awb_mode in AWB_LIGHT_SOURCE_VALUES:
-            exif[EXIF_LIGHT_SOURCE_TAG] = AWB_LIGHT_SOURCE_VALUES[awb_mode]
+            exif_data[EXIF_LIGHT_SOURCE_TAG] = AWB_LIGHT_SOURCE_VALUES[awb_mode]
 
         focus_distance = metadata.get("SubjectDistance", metadata.get("CalibratedFocusDistance"))
         focus_value = ImageProcessor._rational(focus_distance, 1000)
         if focus_value and focus_value[0] >= 0:
-            exif[EXIF_SUBJECT_DISTANCE_TAG] = focus_value
-        exif[EXIF_PIXEL_X_TAG] = int(image.width)
-        exif[EXIF_PIXEL_Y_TAG] = int(image.height)
-        exif[EXIF_USER_COMMENT_TAG] = (
-            b"UNICODE\x00" + ImageProcessor._metadata_json(
-                ImageProcessor._custom_capture_metadata(metadata)
-            ).encode("utf-8")
+            exif_data[EXIF_SUBJECT_DISTANCE_TAG] = focus_value
+        exif_data[EXIF_CUSTOM_RENDERED_TAG] = 1 if processing_metadata else 0
+        custom_metadata = ImageProcessor._capture_metadata_envelope(
+            metadata,
+            source_image,
+            photo_metadata,
+            camera_identity,
+            operating_system,
+            resolved,
+            rotation,
+        )
+        exif_data[EXIF_USER_COMMENT_TAG] = (
+            b"UNICODE\x00" + ImageProcessor._metadata_json(custom_metadata).encode("utf-16-be")
         )
         return exif, resolved
 
@@ -1744,6 +2057,10 @@ class ImageProcessor:
         gb_color_palette=None,
         capture_time=None,
         processing_metadata=None,
+        photo_metadata=None,
+        camera_identity=None,
+        operating_system=None,
+        modified_time=None,
     ):
         Image, _ = _lazy_import_pil()
         exif, resolved_capture_time = ImageProcessor._exif_for_image(
@@ -1752,6 +2069,11 @@ class ImageProcessor:
             rotation=rotation,
             metadata=metadata,
             capture_time=capture_time,
+            photo_metadata=photo_metadata,
+            camera_identity=camera_identity,
+            operating_system=operating_system,
+            modified_time=modified_time,
+            processing_metadata=processing_metadata,
         )
         save_kwargs = {"exif": exif.tobytes()}
         if source_image is not None and source_image.info.get("icc_profile"):
@@ -1764,14 +2086,18 @@ class ImageProcessor:
                 png_info.add_text("reframe:dithering_method", str(dithering_method))
             if gb_color_palette:
                 png_info.add_text("reframe:gb_color_palette", str(gb_color_palette))
-            png_info.add_text("reframe:metadata_schema", "1")
+            png_info.add_text("reframe:metadata_schema", "2")
             png_info.add_text(
                 "reframe:capture_metadata",
-                ImageProcessor._metadata_json({
-                    "schema": 1,
-                    "capture_time": resolved_capture_time.isoformat(),
-                    "sensor": ImageProcessor._custom_capture_metadata(metadata).get("sensor", {}),
-                }),
+                ImageProcessor._metadata_json(ImageProcessor._capture_metadata_envelope(
+                    metadata,
+                    source_image,
+                    photo_metadata,
+                    camera_identity,
+                    operating_system,
+                    resolved_capture_time,
+                    rotation,
+                )),
             )
             if processing_metadata:
                 png_info.add_text(
@@ -1794,6 +2120,10 @@ class ImageProcessor:
         gb_color_palette=None,
         capture_time=None,
         processing_metadata=None,
+        photo_metadata=None,
+        camera_identity=None,
+        operating_system=None,
+        modified_time=None,
     ):
         temp_path = f"{output_path}.tmp-{os.getpid()}-{threading.get_ident()}{os.path.splitext(output_path)[1]}"
         try:
@@ -1807,6 +2137,10 @@ class ImageProcessor:
                 gb_color_palette=gb_color_palette,
                 capture_time=capture_time,
                 processing_metadata=processing_metadata,
+                photo_metadata=photo_metadata,
+                camera_identity=camera_identity,
+                operating_system=operating_system,
+                modified_time=modified_time,
             )
             os.replace(temp_path, output_path)
         finally:
@@ -1850,6 +2184,8 @@ class ImageProcessor:
             metadata = {}
         if not isinstance(metadata, dict):
             metadata = {}
+        if not metadata:
+            metadata = ImageProcessor._custom_metadata_from_source(image)
 
         capture_time = metadata.get("capture_time")
         if isinstance(capture_time, str) and capture_time.strip():
@@ -1873,6 +2209,74 @@ class ImageProcessor:
         return metadata, capture_time, sensor_metadata
 
     @staticmethod
+    def _exif_metadata_from_image(image, capture_metadata, capture_time):
+        exif = image.getexif()
+        exif_data = exif.get_ifd(EXIF_EXIF_IFD_TAG)
+
+        def value(tag, nested=False):
+            raw = (exif_data if nested else exif).get(tag)
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8", errors="replace").rstrip("\x00")
+            if hasattr(raw, "numerator") and hasattr(raw, "denominator"):
+                try:
+                    return float(raw.numerator) / float(raw.denominator) if raw.denominator else None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return None
+            if isinstance(raw, tuple) and len(raw) == 2:
+                try:
+                    return float(raw[0]) / float(raw[1]) if raw[1] else None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return None
+            return raw
+
+        camera = capture_metadata.get("camera")
+        if not isinstance(camera, dict):
+            camera = {
+                "make": value(EXIF_MAKE_TAG),
+                "model": value(EXIF_MODEL_TAG),
+                "hardware_model": value(EXIF_LENS_MODEL_TAG, nested=True),
+            }
+        technical = {
+            "exposure_time": value(EXIF_EXPOSURE_TIME_TAG, nested=True),
+            "f_number": value(EXIF_FNUMBER_TAG, nested=True),
+            "iso": value(EXIF_ISO_TAG, nested=True),
+            "focal_length": value(EXIF_FOCAL_LENGTH_TAG, nested=True),
+            "subject_distance": value(EXIF_SUBJECT_DISTANCE_TAG, nested=True),
+            "white_balance": value(EXIF_WHITE_BALANCE_TAG, nested=True),
+            "light_source": value(EXIF_LIGHT_SOURCE_TAG, nested=True),
+        }
+        technical = {key: item for key, item in technical.items() if item is not None}
+        dates = {
+            "capture": capture_time,
+            "original": value(EXIF_DATETIME_ORIGINAL_TAG, nested=True),
+            "digitized": value(EXIF_DATETIME_DIGITIZED_TAG, nested=True),
+            "modified": value(EXIF_DATETIME_TAG),
+            "capture_offset": value(EXIF_OFFSET_TIME_ORIGINAL_TAG, nested=True),
+            "modified_offset": value(EXIF_OFFSET_TIME_TAG, nested=True),
+            "capture_subsecond": value(EXIF_SUBSEC_TIME_ORIGINAL_TAG, nested=True),
+        }
+        dates = {key: item for key, item in dates.items() if item is not None}
+        author = {
+            "artist": value(EXIF_ARTIST_TAG),
+            "copyright": value(EXIF_COPYRIGHT_TAG),
+            "description": value(EXIF_IMAGE_DESCRIPTION_TAG),
+        }
+        author = {key: item for key, item in author.items() if item}
+        result = {
+            "camera": camera,
+            "operating_system": capture_metadata.get("operating_system"),
+            "software": value(EXIF_SOFTWARE_TAG),
+            "author": author,
+            "dates": dates,
+            "technical": technical,
+            "sensor": capture_metadata.get("sensor", {}),
+        }
+        return {
+            key: item for key, item in result.items()
+            if item not in (None, {}, [])
+        }
+
+    @staticmethod
     def read_dithered_metadata(path):
         Image, _ = _lazy_import_pil()
         try:
@@ -1886,6 +2290,9 @@ class ImageProcessor:
                     "capture_metadata": capture_metadata,
                     "capture_time": capture_time,
                     "sensor_metadata": sensor_metadata,
+                    "exif_metadata": ImageProcessor._exif_metadata_from_image(
+                        image, capture_metadata, capture_time
+                    ),
                     "processing_metadata": image.info.get("reframe:processing_metadata"),
                 }
         except (OSError, ValueError):
@@ -1895,6 +2302,7 @@ class ImageProcessor:
                 "gb_color_palette": None,
                 "capture_time": None,
                 "sensor_metadata": None,
+                "exif_metadata": None,
             }
 
     @staticmethod
@@ -2967,6 +3375,7 @@ class FileManager:
                 "dithering_method": dithered_metadata.get("dithering_method"),
                 "gb_color_palette": dithered_metadata.get("gb_color_palette"),
                 "sensor_metadata": dithered_metadata.get("sensor_metadata"),
+                "exif_metadata": dithered_metadata.get("exif_metadata"),
                 "processing_metadata": dithered_metadata.get("processing_metadata"),
                 "file_size": original_stat.st_size,
                 "created_at": original_stat.st_mtime,
@@ -3678,11 +4087,15 @@ class CameraSystem:
             if result["success"]:
                 capture_metadata = dict(original_image.info.get("reframe_capture_metadata", {}))
                 resolved_capture_time = resolve_capture_timestamp(capture_metadata)
+                photo_metadata, camera_identity, operating_system = self.camera_manager.exif_metadata_context()
                 ImageProcessor.save_image_with_metadata(
                     original_image,
                     temporary_original,
                     metadata=capture_metadata,
                     capture_time=resolved_capture_time,
+                    photo_metadata=photo_metadata,
+                    camera_identity=camera_identity,
+                    operating_system=operating_system,
                 )
                 original_bytes = Path(temporary_original).read_bytes()
                 photo_path, photo_id = self.file_manager.canonical_path_for_bytes(
@@ -3735,6 +4148,9 @@ class CameraSystem:
                     gb_color_palette=processing_settings.get("gb_color_palette"),
                     capture_time=resolved_capture_time,
                     processing_metadata=processing_metadata,
+                    photo_metadata=photo_metadata,
+                    camera_identity=camera_identity,
+                    operating_system=operating_system,
                 )
                 os.replace(temporary_dithered, dithered_path)
                 temporary_dithered = None

@@ -110,6 +110,7 @@ const metadataRows = computed(() => {
     ['dithered', metadataValue(photo.has_dithered, (value) => value ? 'yes' : 'no')],
     ['dither mode', metadataValue(photo.dithering_method || 'not set')],
     ['palette', metadataValue(photo.gb_color_palette || 'not set')],
+    ['EXIF metadata', metadataValue(photo.exif_metadata)],
     ['sensor metadata', metadataValue(photo.sensor_metadata)],
     ['rotation', metadataValue(photo.rotation, (value) => `${Number(value) || 0} quarter turns`)],
   ]
