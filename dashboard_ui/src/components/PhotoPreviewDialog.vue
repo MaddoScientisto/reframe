@@ -16,6 +16,7 @@ import {
   markImagePreviewLoaded,
   setGeneratedPreview,
 } from '../composables/photoPreviewCache'
+import PhotoMetadataTree from './PhotoMetadataTree.vue'
 
 const props = defineProps({
   photo: { type: Object, default: null },
@@ -100,21 +101,37 @@ const metadataRows = computed(() => {
   const photo = props.photo
   if (!photo) return []
   const rows = [
-    ['name', photo.filename || photo.id],
-    ['size', formatFileSize(photo.file_size)],
-    [photo.id_kind === 'content_hash' ? 'hash' : 'id', photo.id],
-    ['capture date', formatDate(photo.capture_time)],
-    ['file date', formatDate(photo.created_at)],
-    ['dimensions', imageDimensions.value ? `${imageDimensions.value.width} x ${imageDimensions.value.height}` : 'not loaded'],
-    ['dithered', photo.has_dithered ? 'yes' : 'no'],
-    ['dither mode', photo.dithering_method || 'not set'],
-    ['palette', photo.gb_color_palette || 'not set'],
-    ['rotation', `${Number(photo.rotation) || 0} quarter turns`],
+    ['name', metadataValue(photo.filename || photo.id)],
+    ['size', metadataValue(photo.file_size, formatFileSize)],
+    [photo.id_kind === 'content_hash' ? 'hash' : 'id', metadataValue(photo.id)],
+    ['capture date', metadataValue(photo.capture_time, formatDate)],
+    ['file date', metadataValue(photo.created_at, formatDate)],
+    ['dimensions', metadataValue(imageDimensions.value ? `${imageDimensions.value.width} x ${imageDimensions.value.height}` : 'not loaded')],
+    ['dithered', metadataValue(photo.has_dithered, (value) => value ? 'yes' : 'no')],
+    ['dither mode', metadataValue(photo.dithering_method || 'not set')],
+    ['palette', metadataValue(photo.gb_color_palette || 'not set')],
+    ['sensor metadata', metadataValue(photo.sensor_metadata)],
+    ['rotation', metadataValue(photo.rotation, (value) => `${Number(value) || 0} quarter turns`)],
   ]
-  if (photo.legacy_id) rows.splice(3, 0, ['legacy id', photo.legacy_id])
-  if (photo.processing_metadata) rows.push(['processing metadata', formatMetadata(photo.processing_metadata)])
+  if (photo.legacy_id) rows.splice(3, 0, ['legacy id', metadataValue(photo.legacy_id)])
+  if (photo.processing_metadata) rows.push(['processing metadata', metadataValue(photo.processing_metadata)])
   return rows.filter(([, value]) => value && value !== 'not set')
 })
+
+function parseJsonValue(value) {
+  if (value && typeof value === 'object') return value
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function metadataValue(value, formatter = (item) => item) {
+  return parseJsonValue(value) || formatter(value)
+}
 
 const sourceDimensions = computed(() => {
   if (!imageDimensions.value) return null
@@ -185,15 +202,6 @@ function formatDate(value) {
   }).format(date)
 }
 
-function formatMetadata(value) {
-  if (typeof value === 'string') return value
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-
 function imageAttributes() {
   if (!imageDimensions.value) return {}
   const width = imageDimensions.value.width
@@ -205,7 +213,7 @@ function imageAttributes() {
 const imageStyle = computed(() => ({
   width: renderedDimensions.value ? `${renderedDimensions.value.width}px` : undefined,
   height: renderedDimensions.value ? `${renderedDimensions.value.height}px` : undefined,
-  transform: `translate3d(${panX.value}px, ${panY.value}px, 0) rotate(${rotation.value * 90}deg)`,
+  transform: `translate3d(calc(-50% + ${panX.value}px), calc(-50% + ${panY.value}px), 0) rotate(${rotation.value * 90}deg)`,
 }))
 
 function cancelPreviewRequest() {
@@ -655,7 +663,6 @@ onUnmounted(() => {
             @pointermove.prevent="movePan"
             @pointerup="stopPan"
             @pointercancel="stopPan"
-            @pointerleave="stopPan"
             @lostpointercapture="stopPan"
           >
             <img
@@ -706,8 +713,11 @@ onUnmounted(() => {
           <summary>photo information</summary>
           <dl class="photo-metadata-list">
             <template v-for="([label, value]) in metadataRows" :key="label">
-              <dt>{{ label }}</dt>
-              <dd :title="value">{{ value }}</dd>
+              <dt :class="{ 'photo-metadata-json-label': parseJsonValue(value) }">{{ label }}</dt>
+              <dd v-if="parseJsonValue(value)" class="photo-metadata-json">
+                <PhotoMetadataTree :value="parseJsonValue(value)" />
+              </dd>
+              <dd v-else :title="value">{{ value }}</dd>
             </template>
           </dl>
         </details>

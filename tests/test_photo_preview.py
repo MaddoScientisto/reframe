@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -134,6 +135,26 @@ class PhotoPreviewTests(unittest.TestCase):
             self.assertEqual(exif.get(reframe.EXIF_SOFTWARE_TAG), "reFrame")
             self.assertAlmostEqual(float(exif.get(reframe.EXIF_EXPOSURE_TIME_TAG)), 0.02)
             self.assertEqual(exif.get(reframe.EXIF_ISO_TAG), 200)
+
+    def test_dithered_metadata_exposes_scalar_capture_time_and_sensor_metadata(self):
+        image = Image.new("RGB", (20, 10), "white")
+        output_path = Path(self.temp_dir.name) / "captured.png"
+        capture_time = datetime(2026, 9, 11, 13, 12, 45, 139352, tzinfo=timezone.utc)
+        reframe.ImageProcessor.save_image_with_metadata(
+            image,
+            str(output_path),
+            metadata={"SensorTimestamp": 266225241000, "LensPosition": 1.0},
+            capture_time=capture_time,
+        )
+
+        metadata = reframe.ImageProcessor.read_dithered_metadata(str(output_path))
+
+        self.assertEqual(metadata["capture_time"], capture_time.isoformat())
+        self.assertEqual(metadata["sensor_metadata"], {
+            "LensPosition": 1.0,
+            "SensorTimestamp": 266225241000,
+        })
+        self.assertEqual(metadata["capture_metadata"]["schema"], 1)
 
 
 if __name__ == "__main__":

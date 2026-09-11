@@ -1837,20 +1837,65 @@ class ImageProcessor:
         return prepared
 
     @staticmethod
+    def _capture_metadata_from_image(image):
+        raw_metadata = image.info.get("reframe:capture_metadata")
+        if isinstance(raw_metadata, dict):
+            metadata = raw_metadata
+        elif isinstance(raw_metadata, str):
+            try:
+                metadata = json.loads(raw_metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        else:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        capture_time = metadata.get("capture_time")
+        if isinstance(capture_time, str) and capture_time.strip():
+            try:
+                resolved_capture_time = datetime.fromisoformat(capture_time.replace("Z", "+00:00"))
+                if resolved_capture_time.tzinfo is None:
+                    resolved_capture_time = resolved_capture_time.replace(tzinfo=timezone.utc)
+                capture_time = resolved_capture_time.isoformat()
+            except ValueError:
+                capture_time = None
+        else:
+            capture_time = None
+
+        if capture_time is None:
+            resolved_capture_time = ImageProcessor._capture_time_from_source(image)
+            capture_time = resolved_capture_time.isoformat() if resolved_capture_time else None
+
+        sensor_metadata = metadata.get("sensor")
+        if not isinstance(sensor_metadata, dict) or not sensor_metadata:
+            sensor_metadata = None
+        return metadata, capture_time, sensor_metadata
+
+    @staticmethod
     def read_dithered_metadata(path):
         Image, _ = _lazy_import_pil()
         try:
             with Image.open(path) as image:
+                capture_metadata, capture_time, sensor_metadata = ImageProcessor._capture_metadata_from_image(image)
                 return {
                     "rotation": ImageProcessor.rotation_from_exif(image),
                     "dithering_method": image.info.get("reframe:dithering_method"),
                     "gb_color_palette": image.info.get("reframe:gb_color_palette"),
                     "metadata_schema": image.info.get("reframe:metadata_schema"),
-                    "capture_metadata": image.info.get("reframe:capture_metadata"),
+                    "capture_metadata": capture_metadata,
+                    "capture_time": capture_time,
+                    "sensor_metadata": sensor_metadata,
                     "processing_metadata": image.info.get("reframe:processing_metadata"),
                 }
         except (OSError, ValueError):
-            return {"rotation": 0, "dithering_method": None, "gb_color_palette": None}
+            return {
+                "rotation": 0,
+                "dithering_method": None,
+                "gb_color_palette": None,
+                "capture_time": None,
+                "sensor_metadata": None,
+            }
 
     @staticmethod
     def get_bayer_matrix(size):
@@ -2903,7 +2948,8 @@ class FileManager:
             resolved_id = identity["id"]
             dithered_path = self._find_dithered_path(original_path, resolved_id)
             has_dithered = dithered_path is not None
-            dithered_metadata = ImageProcessor.read_dithered_metadata(dithered_path) if has_dithered else {}
+            metadata_path = dithered_path or original_path
+            dithered_metadata = ImageProcessor.read_dithered_metadata(metadata_path)
             dithered_updated_at = os.stat(dithered_path).st_mtime_ns if has_dithered else None
 
             # Get file stats
@@ -2920,10 +2966,11 @@ class FileManager:
                 "rotation": dithered_metadata.get("rotation", 0),
                 "dithering_method": dithered_metadata.get("dithering_method"),
                 "gb_color_palette": dithered_metadata.get("gb_color_palette"),
+                "sensor_metadata": dithered_metadata.get("sensor_metadata"),
                 "processing_metadata": dithered_metadata.get("processing_metadata"),
                 "file_size": original_stat.st_size,
                 "created_at": original_stat.st_mtime,
-                "capture_time": dithered_metadata.get("capture_metadata"),
+                "capture_time": dithered_metadata.get("capture_time"),
                 "filename": os.path.basename(original_path)
             }
         except OSError as e:
