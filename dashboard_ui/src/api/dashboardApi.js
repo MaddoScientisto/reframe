@@ -63,6 +63,14 @@ export function displayPreview(body) {
   return jsonRequest('/api/preview/display', 'POST', body)
 }
 
+export function savePhotoPreview(photoId, body) {
+  return jsonRequest(`/api/photos/${encodeURIComponent(photoId)}/save`, 'POST', body)
+}
+
+export function deletePhoto(photoId) {
+  return request(`/api/photos/${encodeURIComponent(photoId)}`, { method: 'DELETE' })
+}
+
 export function generatePreview(photoId, body, signal) {
   return request(`/api/photos/${encodeURIComponent(photoId)}/preview`, {
     method: 'POST',

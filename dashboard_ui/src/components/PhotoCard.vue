@@ -12,6 +12,13 @@ defineEmits(['select', 'display', 'extension'])
 function actionKey(action) {
   return `${action.id}:${props.photo.id}`
 }
+
+function imageSource(photo) {
+  const path = photo.dithered_path || photo.original_path
+  if (!path || !photo.dithered_path || !photo.dithered_updated_at) return path
+  const separator = path.includes('?') ? '&' : '?'
+  return `${path}${separator}v=${photo.dithered_updated_at}`
+}
 </script>
 
 <template>
@@ -28,7 +35,7 @@ function actionKey(action) {
     <div class="photo-frame">
       <img
         class="photo-image"
-        :src="photo.dithered_path || photo.original_path"
+        :src="imageSource(photo)"
         :alt="`Photo ${photo.id}`"
         loading="lazy"
       />

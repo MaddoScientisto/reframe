@@ -93,6 +93,48 @@ class PhotoPreviewTests(unittest.TestCase):
                 self.assertEqual(exported.getpixel((0, 0)), (255, 0, 0))
                 self.assertEqual(exported.getpixel((exported.width - 1, 0)), (0, 0, 255))
 
+    def test_saved_preview_persists_rotation_and_dither_metadata(self):
+        preview = Image.new("P", reframe.DISPLAY_IMAGE_SIZE)
+        output = BytesIO()
+        preview.save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+
+        result = reframe.ImageProcessor.save_dithered_preview_by_id(
+            "test",
+            encoded_png=encoded,
+            rotation=1,
+            dithering_method="ordered",
+            gb_color_palette="blue_yellow",
+            photos_path=self.temp_dir.name,
+            output_path=self.temp_dir.name,
+        )
+
+        self.assertTrue(result["success"])
+        dithered_path = Path(self.temp_dir.name) / "test_dithered.png"
+        with Image.open(dithered_path) as saved:
+            self.assertEqual(saved.format, "PNG")
+            self.assertEqual(saved.getexif().get(reframe.EXIF_ORIENTATION_TAG), 6)
+            self.assertEqual(saved.info.get("reframe:dithering_method"), "ordered")
+            self.assertEqual(saved.info.get("reframe:gb_color_palette"), "blue_yellow")
+            display_image = reframe.ImageProcessor.prepare_dithered_for_display(saved)
+        self.assertEqual(display_image.size, reframe.DISPLAY_IMAGE_SIZE)
+
+    def test_capture_metadata_is_written_to_jpeg_exif(self):
+        image = Image.new("RGB", (20, 10), "white")
+        output_path = Path(self.temp_dir.name) / "captured.jpg"
+        reframe.ImageProcessor.save_image_with_metadata(
+            image,
+            str(output_path),
+            metadata={"ExposureTime": 20_000, "AnalogueGain": 2.0},
+        )
+
+        with Image.open(output_path) as saved:
+            exif = saved.getexif()
+            self.assertEqual(exif.get(reframe.EXIF_ORIENTATION_TAG), 1)
+            self.assertEqual(exif.get(reframe.EXIF_SOFTWARE_TAG), "reFrame")
+            self.assertAlmostEqual(float(exif.get(reframe.EXIF_EXPOSURE_TIME_TAG)), 0.02)
+            self.assertEqual(exif.get(reframe.EXIF_ISO_TAG), 200)
+
 
 if __name__ == "__main__":
     unittest.main()

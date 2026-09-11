@@ -272,6 +272,38 @@ function closePreview() {
   selectedPhoto.value = null
 }
 
+async function handlePhotoUpdated(updatedPhoto) {
+  photos.value = photos.value.map((photo) => (
+    photo.id === updatedPhoto.id ? { ...photo, ...updatedPhoto } : photo
+  ))
+  if (selectedPhoto.value?.id === updatedPhoto.id) {
+    selectedPhoto.value = { ...selectedPhoto.value, ...updatedPhoto }
+  }
+  void loadPhotos(currentPage.value)
+}
+
+async function handlePhotoDeleted(photoId) {
+  const wasVisible = photos.value.some((photo) => photo.id === photoId)
+  if (wasVisible) {
+    photos.value = photos.value.filter((photo) => photo.id !== photoId)
+    const limit = pagination.value.limit || photosPerPage
+    const totalPhotos = Math.max(0, (pagination.value.total_photos || 0) - 1)
+    const totalPages = Math.max(1, Math.ceil(totalPhotos / limit))
+    if (currentPage.value > totalPages) currentPage.value = totalPages
+    pagination.value = {
+      ...pagination.value,
+      total_photos: totalPhotos,
+      total_pages: totalPages,
+      has_prev: currentPage.value > 1,
+      has_next: currentPage.value < totalPages,
+    }
+    updatePageUrl()
+  }
+  selectedPhoto.value = null
+  notify('Photo deleted', 'success')
+  void loadPhotos(currentPage.value)
+}
+
 function changePage(page) {
   const target = Math.min(Math.max(Number(page) || 1, 1), pagination.value.total_pages || 1)
   if (target === currentPage.value) return
@@ -475,6 +507,8 @@ onUnmounted(() => {
       @close="closePreview"
       @notify="notify($event, 'success')"
       @carousel-updated="handleCarouselUpdated"
+      @photo-updated="handlePhotoUpdated"
+      @deleted="handlePhotoDeleted"
     />
     <LivePreviewDialog
       :open="livePreviewOpen"

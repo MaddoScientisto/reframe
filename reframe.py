@@ -95,6 +95,14 @@ DISPLAY_PANEL_WIDTH = 400
 DISPLAY_PANEL_HEIGHT = 600
 DISPLAY_IMAGE_SIZE = (DISPLAY_IMAGE_WIDTH, DISPLAY_IMAGE_HEIGHT)
 DISPLAY_PANEL_SIZE = (DISPLAY_PANEL_WIDTH, DISPLAY_PANEL_HEIGHT)
+EXIF_ORIENTATION_TAG = 274
+EXIF_SOFTWARE_TAG = 305
+EXIF_DATETIME_TAG = 306
+EXIF_DATETIME_ORIGINAL_TAG = 36867
+EXIF_EXPOSURE_TIME_TAG = 33434
+EXIF_ISO_TAG = 34855
+ROTATION_TO_EXIF = {0: 1, 1: 6, 2: 3, 3: 8}
+EXIF_TO_ROTATION = {value: key for key, value in ROTATION_TO_EXIF.items()}
 BUTTON_POLL_INTERVAL_SECONDS = 0.025
 LIVE_PREVIEW_MAX_SIZE = (640, 480)
 LIVE_PREVIEW_FPS = 5
@@ -652,6 +660,13 @@ class CameraManager:
 
         try:
             image = self.capture_image(fast_mode=fast_mode)
+            capture_metadata = {}
+            if hasattr(self.picam2, "capture_metadata"):
+                try:
+                    capture_metadata = dict(self.picam2.capture_metadata() or {})
+                except Exception as error:
+                    logging.debug(f"Could not read capture metadata: {error}")
+            image.info["reframe_capture_metadata"] = capture_metadata
             return {
                 "success": True,
                 "photo_id": os.path.splitext(os.path.basename(file_path))[0],
@@ -1515,6 +1530,137 @@ class ImageProcessor:
     """Handles image processing, including resizing, dithering, and saving."""
 
     @staticmethod
+    def rotation_from_exif(image):
+        try:
+            orientation = int(image.getexif().get(EXIF_ORIENTATION_TAG, 1))
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return EXIF_TO_ROTATION.get(orientation, 0)
+
+    @staticmethod
+    def _exif_for_image(image, source_image=None, rotation=0, metadata=None):
+        exif = image.getexif()
+        if source_image is not None:
+            try:
+                for tag, value in source_image.getexif().items():
+                    exif[tag] = value
+            except (AttributeError, TypeError):
+                pass
+
+        exif[EXIF_ORIENTATION_TAG] = ROTATION_TO_EXIF[rotation]
+        exif[EXIF_SOFTWARE_TAG] = "reFrame"
+        timestamp = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime())
+        exif.setdefault(EXIF_DATETIME_TAG, timestamp)
+        exif.setdefault(EXIF_DATETIME_ORIGINAL_TAG, timestamp)
+        if isinstance(metadata, dict):
+            exposure_time = metadata.get("ExposureTime")
+            if exposure_time is not None:
+                try:
+                    exif[EXIF_EXPOSURE_TIME_TAG] = (int(float(exposure_time)), 1_000_000)
+                except (TypeError, ValueError):
+                    pass
+            analogue_gain = metadata.get("AnalogueGain")
+            if analogue_gain is not None:
+                try:
+                    exif[EXIF_ISO_TAG] = max(1, round(float(analogue_gain) * 100))
+                except (TypeError, ValueError):
+                    pass
+        return exif
+
+    @staticmethod
+    def save_image_with_metadata(
+        image,
+        output_path,
+        source_image=None,
+        rotation=0,
+        metadata=None,
+        dithering_method=None,
+        gb_color_palette=None,
+    ):
+        Image, _ = _lazy_import_pil()
+        exif = ImageProcessor._exif_for_image(
+            image,
+            source_image=source_image,
+            rotation=rotation,
+            metadata=metadata,
+        )
+        save_kwargs = {"exif": exif.tobytes()}
+        if output_path.lower().endswith(".png"):
+            from PIL.PngImagePlugin import PngInfo
+
+            png_info = PngInfo()
+            if dithering_method:
+                png_info.add_text("reframe:dithering_method", str(dithering_method))
+            if gb_color_palette:
+                png_info.add_text("reframe:gb_color_palette", str(gb_color_palette))
+            save_kwargs["pnginfo"] = png_info
+            image.save(output_path, format="PNG", **save_kwargs)
+        else:
+            image.save(output_path, format="JPEG", quality=95, **save_kwargs)
+
+    @staticmethod
+    def save_dithered_image(
+        image,
+        output_path,
+        source_image=None,
+        rotation=0,
+        metadata=None,
+        dithering_method=None,
+        gb_color_palette=None,
+    ):
+        temp_path = f"{output_path}.tmp-{os.getpid()}-{threading.get_ident()}{os.path.splitext(output_path)[1]}"
+        try:
+            ImageProcessor.save_image_with_metadata(
+                image,
+                temp_path,
+                source_image=source_image,
+                rotation=rotation,
+                metadata=metadata,
+                dithering_method=dithering_method,
+                gb_color_palette=gb_color_palette,
+            )
+            os.replace(temp_path, output_path)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def prepare_dithered_for_display(image):
+        Image, _ = _lazy_import_pil()
+        from PIL import ImageOps
+
+        rotation = ImageProcessor.rotation_from_exif(image)
+        prepared = ImageOps.exif_transpose(image)
+        transpose = getattr(Image, "Transpose", Image)
+        inverse_transpose = {
+            1: transpose.ROTATE_90,
+            2: transpose.ROTATE_180,
+            3: transpose.ROTATE_270,
+        }.get(rotation)
+        if inverse_transpose is not None:
+            prepared = prepared.transpose(inverse_transpose)
+        if prepared.size == DISPLAY_PANEL_SIZE:
+            prepared = prepared.rotate(90, expand=True)
+        if prepared.size != DISPLAY_IMAGE_SIZE:
+            prepared = ImageProcessor.resize_image(prepared)
+        return prepared
+
+    @staticmethod
+    def read_dithered_metadata(path):
+        Image, _ = _lazy_import_pil()
+        try:
+            with Image.open(path) as image:
+                return {
+                    "rotation": ImageProcessor.rotation_from_exif(image),
+                    "dithering_method": image.info.get("reframe:dithering_method"),
+                    "gb_color_palette": image.info.get("reframe:gb_color_palette"),
+                }
+        except (OSError, ValueError):
+            return {"rotation": 0, "dithering_method": None, "gb_color_palette": None}
+
+    @staticmethod
     def get_bayer_matrix(size):
         """Generate Bayer matrix for ordered dithering."""
         np = _lazy_import_numpy()
@@ -2275,12 +2421,20 @@ class ImageProcessor:
     def process_photo_with_settings(original_path, output_path, processing_settings):
         """Process a photo with specific settings and save it."""
         try:
-            dithered_image = ImageProcessor.render_photo_with_settings(
-                original_path, processing_settings
-            )
-
-            # Save processed image as PNG (keep palette if present)
-            dithered_image.save(output_path, format="PNG")
+            Image, _ = _lazy_import_pil()
+            rotation = ImageProcessor.read_dithered_metadata(output_path).get("rotation", 0)
+            with Image.open(original_path) as original_image:
+                dithered_image = ImageProcessor.render_photo_with_settings(
+                    original_path, processing_settings
+                )
+                ImageProcessor.save_dithered_image(
+                    dithered_image,
+                    output_path,
+                    source_image=original_image,
+                    rotation=rotation,
+                    dithering_method=processing_settings.get("dithering_method"),
+                    gb_color_palette=processing_settings.get("gb_color_palette"),
+                )
             logging.info(f"Processed image saved to {output_path}")
 
             return {
@@ -2297,6 +2451,62 @@ class ImageProcessor:
                 "error": str(e),
                 "message": f"Photo processing failed: {str(e)}"
             }
+
+    @staticmethod
+    def save_dithered_preview_by_id(
+        photo_id,
+        encoded_png=None,
+        rotation=0,
+        dithering_method="floyd_steinberg",
+        gb_color_palette="blue_yellow",
+        photos_path=SAVE_PATH,
+        output_path=PROCESSED_PATH,
+    ):
+        Image, _ = _lazy_import_pil()
+        original_path = None
+        for extension in ("png", "jpg", "jpeg"):
+            candidate = os.path.join(photos_path, f"{photo_id}.{extension}")
+            if os.path.exists(candidate):
+                original_path = candidate
+                break
+        if not original_path:
+            return {"success": False, "error": "Original photo not found", "message": "Photo not found"}
+
+        dithered_path = os.path.join(output_path, f"{photo_id}_dithered.png")
+        try:
+            if encoded_png:
+                with Image.open(BytesIO(base64.b64decode(encoded_png, validate=True))) as preview:
+                    if preview.format != "PNG" or preview.size != DISPLAY_IMAGE_SIZE:
+                        raise ValueError("Preview must be a display-sized PNG")
+                    dithered_image = preview.copy()
+            elif os.path.exists(dithered_path):
+                with Image.open(dithered_path) as saved_image:
+                    dithered_image = saved_image.copy()
+            else:
+                return {"success": False, "error": "Dithered photo not found", "message": "Photo has no dithered version"}
+
+            with Image.open(original_path) as original_image:
+                ImageProcessor.save_dithered_image(
+                    dithered_image,
+                    dithered_path,
+                    source_image=original_image,
+                    rotation=rotation,
+                    dithering_method=dithering_method,
+                    gb_color_palette=gb_color_palette,
+                )
+            dithered_image.close()
+        except (OSError, ValueError, TypeError) as error:
+            return {"success": False, "error": str(error), "message": "Could not save dithered photo"}
+
+        return {
+            "success": True,
+            "photo_id": photo_id,
+            "processed_path": dithered_path,
+            "rotation": rotation,
+            "dithering_method": dithering_method,
+            "gb_color_palette": gb_color_palette,
+            "message": "Dithered photo saved",
+        }
 
     @staticmethod
     def reprocess_photo_by_id(photo_id, processing_settings, photos_path=SAVE_PATH, output_path=PROCESSED_PATH):
@@ -2382,6 +2592,8 @@ class FileManager:
             # Check for dithered version
             dithered_path = os.path.join(self.processed_path, f"{photo_id}_dithered.png")
             has_dithered = os.path.exists(dithered_path)
+            dithered_metadata = ImageProcessor.read_dithered_metadata(dithered_path) if has_dithered else {}
+            dithered_updated_at = os.stat(dithered_path).st_mtime_ns if has_dithered else None
 
             # Get file stats
             original_stat = os.stat(original_path)
@@ -2391,6 +2603,10 @@ class FileManager:
                 "original_path": original_path,
                 "dithered_path": dithered_path if has_dithered else None,
                 "has_dithered": has_dithered,
+                "dithered_updated_at": dithered_updated_at,
+                "rotation": dithered_metadata.get("rotation", 0),
+                "dithering_method": dithered_metadata.get("dithering_method"),
+                "gb_color_palette": dithered_metadata.get("gb_color_palette"),
                 "file_size": original_stat.st_size,
                 "created_at": original_stat.st_mtime,
                 "filename": os.path.basename(original_path)
@@ -2667,31 +2883,25 @@ class EInkDisplay:
                 image_path = photo_info["original_path"]
                 version = "original"
 
-            # Load and display the image
-            Image, ImageEnhance = _lazy_import_pil()
-            image = Image.open(image_path)
-
-            # If displaying original, we need to process it first
-            if version == "original":
-                resized_image = ImageProcessor.resize_image(image)
-                settings = processing_settings or {}
-                display_image = ImageProcessor.apply_dithering(
-                    resized_image,
-                    saturation=settings.get("saturation", 0.6),
-                    brightness_factor=settings.get("brightness_factor", 1.1),
-                    color_factor=settings.get("color_factor", 1.4),
-                    dithering_method=settings.get("dithering_method", "floyd_steinberg"),
-                    bayer_size=settings.get("bayer_size", 4),
-                    threshold_scale=settings.get("threshold_scale", 1.0),
-                    tone_map=settings.get("tone_map", "percentile"),
-                    gb_color_palette=settings.get("gb_color_palette", "blue_yellow")
-                )
+            Image, _ = _lazy_import_pil()
+            with Image.open(image_path) as image:
+                if version == "original":
+                    resized_image = ImageProcessor.resize_image(image)
+                    settings = processing_settings or {}
+                    display_image = ImageProcessor.apply_dithering(
+                        resized_image,
+                        saturation=settings.get("saturation", 0.6),
+                        brightness_factor=settings.get("brightness_factor", 1.1),
+                        color_factor=settings.get("color_factor", 1.4),
+                        dithering_method=settings.get("dithering_method", "floyd_steinberg"),
+                        bayer_size=settings.get("bayer_size", 4),
+                        threshold_scale=settings.get("threshold_scale", 1.0),
+                        tone_map=settings.get("tone_map", "percentile"),
+                        gb_color_palette=settings.get("gb_color_palette", "blue_yellow")
+                    )
+                else:
+                    display_image = ImageProcessor.prepare_dithered_for_display(image)
                 self.display_image(display_image)
-            else:
-                # Dithered image can be displayed directly (just resize if needed)
-                if image.size != DISPLAY_IMAGE_SIZE:
-                    image = ImageProcessor.resize_image(image)
-                self.display_image(image)
 
             logging.info(f"Displayed {version} version of photo {photo_id} on e-ink screen")
 
@@ -3113,10 +3323,22 @@ class CameraSystem:
                 result["processed_path"] = dithered_path
                 def _save_outputs():
                     try:
-                        original_image.save(photo_path, format="JPEG")
+                        capture_metadata = original_image.info.get("reframe_capture_metadata", {})
+                        ImageProcessor.save_image_with_metadata(
+                            original_image,
+                            photo_path,
+                            metadata=capture_metadata,
+                        )
                         result["file_size"] = os.path.getsize(photo_path)
                         logging.info(f"Original JPEG saved: {photo_path}")
-                        dithered_image.save(dithered_path, format="PNG")
+                        ImageProcessor.save_dithered_image(
+                            dithered_image,
+                            dithered_path,
+                            source_image=original_image,
+                            metadata=capture_metadata,
+                            dithering_method=processing_settings.get("dithering_method"),
+                            gb_color_palette=processing_settings.get("gb_color_palette"),
+                        )
                         logging.info(f"Dithered PNG saved: {dithered_path}")
                     except Exception as e:
                         logging.error(f"Error saving photo outputs: {e}")
@@ -3148,6 +3370,22 @@ class CameraSystem:
             processing_settings = self.camera_manager.settings.get("processing", {})
 
         return ImageProcessor.reprocess_photo_by_id(photo_id, processing_settings)
+
+    def save_photo_api(
+        self,
+        photo_id,
+        encoded_png=None,
+        rotation=0,
+        dithering_method="floyd_steinberg",
+        gb_color_palette="blue_yellow",
+    ):
+        return ImageProcessor.save_dithered_preview_by_id(
+            photo_id,
+            encoded_png=encoded_png,
+            rotation=rotation,
+            dithering_method=dithering_method,
+            gb_color_palette=gb_color_palette,
+        )
 
     def list_photos_api(self):
         """API-style photo listing."""
@@ -3499,6 +3737,36 @@ def _create_fastapi_routes():
             output = BytesIO()
             image.save(output, format="PNG")
         return {"png": base64.b64encode(output.getvalue()).decode("ascii")}
+
+    @app.post("/api/photos/{photo_id}/save")
+    def api_save_photo(photo_id: str, body: Dict[str, Any]):
+        if camera_system is None:
+            raise HTTPException(status_code=503, detail="Camera system not initialized")
+        encoded_png = body.get("png")
+        if encoded_png is not None and (not isinstance(encoded_png, str) or len(encoded_png) > 2_000_000):
+            raise HTTPException(status_code=400, detail="Invalid preview image")
+        rotation = body.get("rotation", 0)
+        if isinstance(rotation, bool) or not isinstance(rotation, int) or rotation not in range(4):
+            raise HTTPException(status_code=400, detail="Invalid image rotation")
+        dithering_method = body.get("dithering_method", "floyd_steinberg")
+        if dithering_method not in ("floyd_steinberg", "ordered", "bayer_natural_pair", "gb-default", "gb-default-color"):
+            raise HTTPException(status_code=400, detail="Unsupported dithering mode")
+        gb_color_palette = body.get("gb_color_palette", "blue_yellow")
+        if gb_color_palette not in ("blue_yellow", "green_yellow", "red_yellow", "blue_red", "blue_green"):
+            raise HTTPException(status_code=400, detail="Unsupported color palette")
+        with _operation_lock:
+            camera_system.update_activity()
+            result = camera_system.save_photo_api(
+                photo_id,
+                encoded_png=encoded_png,
+                rotation=rotation,
+                dithering_method=dithering_method,
+                gb_color_palette=gb_color_palette,
+            )
+        if not result.get("success"):
+            raise HTTPException(status_code=404, detail=result.get("message", "Could not save photo"))
+        result["photo"] = camera_system.get_photo_info_api(photo_id)
+        return result
 
     @app.post("/api/preview/display")
     def api_display_preview(body: Dict[str, Any]):

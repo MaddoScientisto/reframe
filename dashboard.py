@@ -964,6 +964,40 @@ async def get_photo_info(photo_id: str):
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+@app.delete("/api/photos/{photo_id}")
+async def delete_photo(photo_id: str):
+    """Delete both the original and dithered files for one photo."""
+    try:
+        result = await reframe_client.delete(f"/photos/{photo_id}")
+        if not result.get("success", False):
+            raise HTTPException(status_code=404, detail=result.get("error", "Photo not found"))
+        return result
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=error.response.status_code, detail="Could not delete photo") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Photo service unavailable: {error}") from error
+
+@app.post("/api/photos/{photo_id}/save")
+async def save_photo_preview(photo_id: str, body: Dict[str, Any]):
+    """Replace a photo's dithered image and persist its preview metadata."""
+    try:
+        result = await reframe_client.post(f"/photos/{photo_id}/save", json=body)
+        photo = result.get("photo")
+        if isinstance(photo, dict):
+            from os.path import basename as _bn
+            if photo.get("original_path"):
+                photo["original_path"] = f"/photos/{_bn(photo['original_path'])}"
+            if photo.get("dithered_path"):
+                photo["dithered_path"] = f"/dithered/{_bn(photo['dithered_path'])}"
+        return result
+    except httpx.HTTPStatusError as error:
+        detail = error.response.text or "Could not save photo"
+        raise HTTPException(status_code=error.response.status_code, detail=detail) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Photo service unavailable: {error}") from error
+
 @app.get("/photos/{filename}")
 async def serve_original_photo(filename: str):
     """Serve original photo file."""
