@@ -980,6 +980,7 @@ select {
   max-width: none;
   max-height: none;
   flex: none;
+  image-orientation: from-image;
   object-fit: contain;
   transform-origin: center;
   pointer-events: none;

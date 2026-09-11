@@ -145,8 +145,8 @@ const sourceDimensions = computed(() => {
 const renderedDimensions = computed(() => {
   if (!sourceDimensions.value) return null
   const { width, height } = sourceDimensions.value
-  const rotatedWidth = rotation.value % 2 ? height : width
-  const rotatedHeight = rotation.value % 2 ? width : height
+  const rotatedWidth = previewRotation.value % 2 ? height : width
+  const rotatedHeight = previewRotation.value % 2 ? width : height
   const viewportWidth = viewportSize.value.width
   const viewportHeight = viewportSize.value.height
   const fitScale = viewportWidth > 0 && viewportHeight > 0
@@ -160,16 +160,24 @@ const renderedDimensions = computed(() => {
 
 const visualDimensions = computed(() => {
   if (!renderedDimensions.value) return null
-  return rotation.value % 2
+  return previewRotation.value % 2
     ? { width: renderedDimensions.value.height, height: renderedDimensions.value.width }
     : renderedDimensions.value
 })
 
+const sourceExifRotation = computed(() => (
+  tab.value === 'dithered' && !isGenerated.value ? initialRotation.value : 0
+))
+
+const previewRotation = computed(() => (
+  (rotation.value - sourceExifRotation.value + 4) % 4
+))
+
 const stageStyle = computed(() => {
   if (!sourceDimensions.value) return {}
   const { width: sourceWidth, height: sourceHeight } = sourceDimensions.value
-  const width = rotation.value % 2 ? sourceHeight : sourceWidth
-  const height = rotation.value % 2 ? sourceWidth : sourceHeight
+  const width = previewRotation.value % 2 ? sourceHeight : sourceWidth
+  const height = previewRotation.value % 2 ? sourceWidth : sourceHeight
   return {
     '--preview-stage-ratio': `${width} / ${height}`,
     '--preview-stage-ratio-value': width / height,
@@ -214,7 +222,7 @@ function imageAttributes() {
 const imageStyle = computed(() => ({
   width: renderedDimensions.value ? `${renderedDimensions.value.width}px` : undefined,
   height: renderedDimensions.value ? `${renderedDimensions.value.height}px` : undefined,
-  transform: `translate3d(calc(-50% + ${panX.value}px), calc(-50% + ${panY.value}px), 0) rotate(${rotation.value * 90}deg)`,
+  transform: `translate3d(calc(-50% + ${panX.value}px), calc(-50% + ${panY.value}px), 0) rotate(${previewRotation.value * 90}deg)`,
 }))
 
 function cancelPreviewRequest() {
@@ -314,6 +322,12 @@ async function generatePhotoPreview() {
 function setTab(nextTab) {
   tab.value = nextTab
   imageDimensions.value = null
+  nextTick(() => {
+    const image = stageRef.value?.querySelector('.preview-image')
+    if (!image?.complete || !image.naturalWidth) return
+    syncImageDimensions(image)
+    updateViewportSize()
+  })
 }
 
 function handleTabKeydown(event) {
@@ -351,17 +365,24 @@ function handleClose() {
 
 function rotate(direction) {
   rotation.value = (rotation.value + direction + 4) % 4
-  clampPan()
+  nextTick(() => {
+    updateViewportSize()
+    clampPan()
+  })
 }
 
 function handleImageLoad(event) {
-  markImagePreviewLoaded(imageSource.value)
-  imageDimensions.value = {
-    width: event.target.naturalWidth,
-    height: event.target.naturalHeight,
-  }
+  syncImageDimensions(event.target)
   nextTick(updateViewportSize)
   clampPan()
+}
+
+function syncImageDimensions(image) {
+  markImagePreviewLoaded(image.currentSrc || imageSource.value)
+  imageDimensions.value = {
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+  }
 }
 
 function resetViewport() {
@@ -516,13 +537,20 @@ async function savePreview() {
       dithering_method: result.dithering_method || effectiveDitherMode.value,
       gb_color_palette: result.gb_color_palette || palette.value,
     }
+    const savedRotation = Number.isInteger(updatedPhoto.rotation)
+      ? ((updatedPhoto.rotation % 4) + 4) % 4
+      : rotation.value
     initialMode.value = 'saved'
     initialPalette.value = updatedPhoto.gb_color_palette
-    initialRotation.value = updatedPhoto.rotation
+    initialRotation.value = savedRotation
+    rotation.value = savedRotation
     mode.value = 'saved'
     generatedPng.value = ''
     downloadPng.value = ''
+    imageDimensions.value = null
+    resetViewport()
     savedRevision.value = updatedPhoto.dithered_updated_at || String(Date.now())
+    updatedPhoto.rotation = savedRotation
     emit('photo-updated', updatedPhoto)
     emit('notify', result.message || 'Dithered photo saved')
   } catch (saveError) {
@@ -668,6 +696,7 @@ onUnmounted(() => {
           >
             <img
               v-if="imageSource"
+              :key="imageSource"
               class="preview-image"
               :class="{ dithered: tab === 'dithered' }"
               :src="imageSource"
