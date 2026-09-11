@@ -4,9 +4,13 @@ import { computed } from 'vue'
 const props = defineProps({
   pagination: { type: Object, required: true },
   currentPage: { type: Number, required: true },
+  pageSize: { type: Number, required: true },
+  pageSizeOptions: { type: Array, default: () => [] },
+  loading: { type: Boolean, default: false },
+  placement: { type: String, default: 'bottom' },
 })
 
-defineEmits(['change'])
+defineEmits(['change', 'change-page-size'])
 
 const visiblePages = computed(() => {
   const totalPages = Math.max(1, props.pagination.total_pages || 1)
@@ -30,19 +34,22 @@ const visiblePages = computed(() => {
   return pages
 })
 
-const rangeStart = computed(() => ((props.currentPage - 1) * (props.pagination.limit || 12)) + 1)
+const rangeStart = computed(() => props.pagination.total_photos
+  ? ((props.pagination.page || props.currentPage) - 1) * (props.pagination.limit || props.pageSize) + 1
+  : 0)
 const rangeEnd = computed(() => Math.min(
-  props.currentPage * (props.pagination.limit || 12),
+  (props.pagination.page || props.currentPage) * (props.pagination.limit || props.pageSize),
   props.pagination.total_photos || 0,
 ))
+const pageInputId = computed(() => `page-jump-input-${props.placement}`)
 </script>
 
 <template>
-  <nav v-if="pagination.total_pages > 1" class="pagination" aria-label="Photo pages">
+  <nav v-if="pagination.total_pages > 1 || pageSizeOptions.length" class="pagination" :class="`pagination-${placement}`" aria-label="Photo pages">
     <button
       class="pagination-button"
       type="button"
-      :disabled="!pagination.has_prev"
+      :disabled="loading || !pagination.has_prev"
       @click="$emit('change', currentPage - 1)"
     >
       previous
@@ -55,6 +62,7 @@ const rangeEnd = computed(() => Math.min(
           class="pagination-button"
           :class="{ active: page === currentPage }"
           type="button"
+          :disabled="loading"
           @click="$emit('change', page)"
         >
           {{ page }}
@@ -63,17 +71,23 @@ const rangeEnd = computed(() => Math.min(
     </div>
     <span class="pagination-info">{{ rangeStart }}-{{ rangeEnd }} of {{ pagination.total_photos }}</span>
     <form class="page-jump" @submit.prevent="$emit('change', Number($event.target.elements.page.value))">
-      <label for="page-jump-input">page</label>
-      <input id="page-jump-input" name="page" type="number" min="1" :max="pagination.total_pages" :value="currentPage" />
-      <button class="pagination-button" type="submit">go</button>
+      <label :for="pageInputId">page</label>
+      <input :id="pageInputId" name="page" type="number" min="1" :max="pagination.total_pages" :value="currentPage" :disabled="loading" />
+      <button class="pagination-button" type="submit" :disabled="loading">go</button>
     </form>
     <button
       class="pagination-button"
       type="button"
-      :disabled="!pagination.has_next"
+      :disabled="loading || !pagination.has_next"
       @click="$emit('change', currentPage + 1)"
     >
       next
     </button>
+    <label class="page-size-control">
+      <span>photos per page</span>
+      <select :value="pageSize" :disabled="loading" @change="$emit('change-page-size', Number($event.target.value))">
+        <option v-for="option in pageSizeOptions" :key="option" :value="option">{{ option }}</option>
+      </select>
+    </label>
   </nav>
 </template>

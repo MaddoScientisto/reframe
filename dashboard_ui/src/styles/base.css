@@ -202,6 +202,21 @@ p {
   gap: 22px;
 }
 
+.gallery-pages {
+  position: relative;
+}
+
+.gallery-page {
+  scroll-margin-top: 24px;
+  margin-bottom: 24px;
+}
+
+.gallery-fetching {
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .photo-card {
   min-width: 0;
   border: 1px solid var(--soft-line);
@@ -220,6 +235,7 @@ p {
 }
 
 .photo-frame {
+  position: relative;
   aspect-ratio: 3 / 2;
   overflow: hidden;
   background: #ded8d5;
@@ -235,6 +251,65 @@ p {
 
 .photo-card:hover .photo-image {
   transform: scale(1.025);
+}
+
+.image-placeholder,
+.image-error {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  align-content: center;
+  color: var(--muted);
+  text-align: center;
+}
+
+.image-error {
+  background: #e9e2df;
+}
+
+.loading-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--soft-line);
+  border-top-color: var(--ink);
+  border-radius: 50%;
+  animation: gallery-spin 800ms linear infinite;
+}
+
+.gallery-sentinel {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.skeleton-card {
+  cursor: default;
+}
+
+.skeleton-frame,
+.skeleton-line,
+.skeleton-actions {
+  background: linear-gradient(90deg, #e4ddda 25%, #f2edeb 50%, #e4ddda 75%);
+  background-size: 200% 100%;
+  animation: gallery-shimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton-line {
+  width: 65%;
+  height: 14px;
+  margin-bottom: 14px;
+}
+
+.skeleton-actions {
+  width: 90%;
+  height: 30px;
 }
 
 .photo-info {
@@ -292,6 +367,10 @@ p {
   flex-wrap: wrap;
 }
 
+.pagination-top {
+  margin: 0 0 24px;
+}
+
 .page-numbers {
   display: flex;
   gap: 4px;
@@ -329,6 +408,37 @@ select {
 
 .page-jump input {
   width: 62px;
+}
+
+.page-size-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.page-size-control select {
+  min-width: 70px;
+}
+
+@keyframes gallery-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes gallery-shimmer {
+  to { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 .modal-backdrop {
@@ -471,9 +581,11 @@ select {
 }
 
 .preview-dialog {
-  width: min(880px, calc(100% - 24px));
+  width: min(1080px, calc(100% - 24px));
   max-width: none;
+  max-height: calc(100dvh - 24px);
   border: 1px solid var(--ink);
+  overflow: auto;
   padding: 0;
   background: var(--paper);
   box-shadow: var(--shadow);
@@ -524,6 +636,17 @@ select {
   padding: 24px;
 }
 
+.preview-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+  align-items: start;
+  gap: 24px;
+}
+
+.preview-visual {
+  min-width: 0;
+}
+
 .preview-stage {
   position: relative;
   display: grid;
@@ -533,6 +656,7 @@ select {
   overflow: hidden;
   background: #d8d1ce;
   cursor: grab;
+  overscroll-behavior: contain;
   touch-action: none;
   user-select: none;
 }
@@ -856,7 +980,9 @@ select {
   flex: none;
   object-fit: contain;
   transform-origin: center;
+  pointer-events: none;
   transition: transform 120ms ease;
+  user-select: none;
   will-change: transform;
 }
 
@@ -891,6 +1017,44 @@ select {
 
 .preview-delete-button {
   margin-left: auto;
+}
+
+.photo-metadata {
+  min-width: 0;
+  border: 1px solid var(--soft-line);
+  background: var(--panel);
+}
+
+.photo-metadata > summary {
+  padding: 14px 16px;
+  color: var(--ink);
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.photo-metadata > summary::marker {
+  display: none;
+}
+
+.photo-metadata-list {
+  display: grid;
+  grid-template-columns: minmax(70px, auto) minmax(0, 1fr);
+  gap: 9px 12px;
+  margin: 0;
+  border-top: 1px solid var(--soft-line);
+  padding: 16px;
+  font-size: 0.82rem;
+}
+
+.photo-metadata-list dt {
+  color: var(--muted);
+}
+
+.photo-metadata-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
 }
 
 .confirmation-dialog {
@@ -1101,6 +1265,36 @@ select {
 
   .preview-panel {
     padding: 16px;
+  }
+
+  .preview-tab-row {
+    flex-wrap: wrap;
+  }
+
+  .preview-tab-row .preview-tabs,
+  .preview-tab-row .preview-rotation {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .preview-tab-row .preview-rotation {
+    justify-content: flex-start;
+    border-top: 1px solid var(--soft-line);
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .preview-content {
+    display: block;
+  }
+
+  .photo-metadata {
+    margin-top: 16px;
+  }
+
+  .photo-metadata > summary {
+    cursor: pointer;
+    pointer-events: auto;
   }
 
   .live-preview-panel {

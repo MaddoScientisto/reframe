@@ -10,6 +10,12 @@ import {
   savePhotoPreview,
   setCarouselPhoto,
 } from '../api/dashboardApi'
+import {
+  generatedPreviewKey,
+  getGeneratedPreview,
+  markImagePreviewLoaded,
+  setGeneratedPreview,
+} from '../composables/photoPreviewCache'
 
 const props = defineProps({
   photo: { type: Object, default: null },
@@ -39,9 +45,11 @@ const ditherControlsOpen = ref(false)
 const extensionBusy = ref('')
 const carouselIncluded = ref(false)
 const carouselSaving = ref(false)
+const metadataOpen = ref(true)
 const revision = ref(0)
-const savedRevision = ref(0)
+const savedRevision = ref('')
 const stageRef = ref(null)
+const viewportSize = ref({ width: 0, height: 0 })
 const zoom = ref(1)
 const panX = ref(0)
 const panY = ref(0)
@@ -49,6 +57,7 @@ const dragging = ref(false)
 const dragOrigin = ref(null)
 const maxZoom = 4
 let requestController = null
+let stageResizeObserver = null
 
 const isGenerated = computed(() => mode.value !== 'saved')
 const hasChanges = computed(() => (
@@ -65,7 +74,9 @@ const previewSource = computed(() => {
   if (!isGenerated.value) {
     const path = props.photo.dithered_path || ''
     if (!path) return ''
-    return `${path}${path.includes('?') ? '&' : '?'}v=${savedRevision.value}`
+    const version = props.photo.dithered_updated_at || savedRevision.value
+    if (!version) return path
+    return `${path}${path.includes('?') ? '&' : '?'}v=${version}`
   }
   return generatedPng.value ? `data:image/png;base64,${generatedPng.value}` : ''
 })
@@ -85,6 +96,26 @@ const ditheredFilename = computed(() => {
     : `${props.photo.id}_dithered.png`
 })
 
+const metadataRows = computed(() => {
+  const photo = props.photo
+  if (!photo) return []
+  const rows = [
+    ['name', photo.filename || photo.id],
+    ['size', formatFileSize(photo.file_size)],
+    [photo.id_kind === 'content_hash' ? 'hash' : 'id', photo.id],
+    ['capture date', formatDate(photo.capture_time)],
+    ['file date', formatDate(photo.created_at)],
+    ['dimensions', imageDimensions.value ? `${imageDimensions.value.width} x ${imageDimensions.value.height}` : 'not loaded'],
+    ['dithered', photo.has_dithered ? 'yes' : 'no'],
+    ['dither mode', photo.dithering_method || 'not set'],
+    ['palette', photo.gb_color_palette || 'not set'],
+    ['rotation', `${Number(photo.rotation) || 0} quarter turns`],
+  ]
+  if (photo.legacy_id) rows.splice(3, 0, ['legacy id', photo.legacy_id])
+  if (photo.processing_metadata) rows.push(['processing metadata', formatMetadata(photo.processing_metadata)])
+  return rows.filter(([, value]) => value && value !== 'not set')
+})
+
 const sourceDimensions = computed(() => {
   if (!imageDimensions.value) return null
   return {
@@ -96,9 +127,16 @@ const sourceDimensions = computed(() => {
 const renderedDimensions = computed(() => {
   if (!sourceDimensions.value) return null
   const { width, height } = sourceDimensions.value
+  const rotatedWidth = rotation.value % 2 ? height : width
+  const rotatedHeight = rotation.value % 2 ? width : height
+  const viewportWidth = viewportSize.value.width
+  const viewportHeight = viewportSize.value.height
+  const fitScale = viewportWidth > 0 && viewportHeight > 0
+    ? Math.min(viewportWidth / rotatedWidth, viewportHeight / rotatedHeight)
+    : 1
   return {
-    width: width * zoom.value,
-    height: height * zoom.value,
+    width: width * fitScale * zoom.value,
+    height: height * fitScale * zoom.value,
   }
 })
 
@@ -124,6 +162,36 @@ function evenDimension(value) {
   const dimension = Number(value)
   if (!Number.isFinite(dimension) || dimension < 2) return dimension
   return Math.ceil(dimension / 2) * 2
+}
+
+function formatFileSize(value) {
+  const size = Number(value)
+  if (!Number.isFinite(size) || size < 0) return 'unknown'
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / (1024 * 1024)).toFixed(2)} MB`
+}
+
+function formatDate(value) {
+  if (value === null || value === undefined || value === '') return 'unknown'
+  const numericValue = Number(value)
+  const date = Number.isFinite(numericValue) && numericValue > 0
+    ? new Date(numericValue * 1000)
+    : new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+  }).format(date)
+}
+
+function formatMetadata(value) {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
 }
 
 function imageAttributes() {
@@ -165,7 +233,7 @@ function resetPreviewState(photo) {
   extensionBusy.value = ''
   carouselIncluded.value = Boolean(photo.carousel_enabled)
   carouselSaving.value = false
-  savedRevision.value += 1
+  savedRevision.value = ''
 }
 
 watch(
@@ -195,6 +263,15 @@ async function generatePhotoPreview() {
   if (!props.photo || !isGenerated.value) return
   cancelPreviewRequest()
   const currentRevision = ++revision.value
+  const cacheKey = generatedPreviewKey(props.photo.id, mode.value, palette.value)
+  const cached = getGeneratedPreview(cacheKey)
+  if (cached) {
+    generatedPng.value = cached.png
+    downloadPng.value = cached.downloadPng
+    loading.value = false
+    error.value = ''
+    return
+  }
   requestController = new AbortController()
   loading.value = true
   error.value = ''
@@ -210,6 +287,10 @@ async function generatePhotoPreview() {
     if (currentRevision !== revision.value || !props.photo) return
     generatedPng.value = result.png || ''
     downloadPng.value = result.download_png || result.png || ''
+    setGeneratedPreview(cacheKey, {
+      png: generatedPng.value,
+      downloadPng: downloadPng.value,
+    })
   } catch (requestError) {
     if (requestError.name !== 'AbortError' && currentRevision === revision.value) {
       error.value = requestError.message || 'Could not generate preview'
@@ -265,10 +346,12 @@ function rotate(direction) {
 }
 
 function handleImageLoad(event) {
+  markImagePreviewLoaded(imageSource.value)
   imageDimensions.value = {
     width: event.target.naturalWidth,
     height: event.target.naturalHeight,
   }
+  nextTick(updateViewportSize)
   clampPan()
 }
 
@@ -278,6 +361,15 @@ function resetViewport() {
   panY.value = 0
   dragging.value = false
   dragOrigin.value = null
+}
+
+function updateViewportSize() {
+  if (!stageRef.value) return
+  viewportSize.value = {
+    width: stageRef.value.clientWidth,
+    height: stageRef.value.clientHeight,
+  }
+  clampPan()
 }
 
 function setZoom(nextZoom) {
@@ -309,6 +401,7 @@ function clampPan() {
 }
 
 function startPan(event) {
+  event.preventDefault()
   const bounds = panBounds()
   if (!bounds.x && !bounds.y) return
   dragging.value = true
@@ -324,6 +417,7 @@ function startPan(event) {
 
 function movePan(event) {
   if (!dragging.value || !dragOrigin.value || event.pointerId !== dragOrigin.value.pointerId) return
+  event.preventDefault()
   panX.value = dragOrigin.value.panX + event.clientX - dragOrigin.value.x
   panY.value = dragOrigin.value.panY + event.clientY - dragOrigin.value.y
   clampPan()
@@ -331,6 +425,7 @@ function movePan(event) {
 
 function stopPan(event) {
   if (dragOrigin.value && event.pointerId !== dragOrigin.value.pointerId) return
+  event.currentTarget.releasePointerCapture?.(event.pointerId)
   dragging.value = false
   dragOrigin.value = null
 }
@@ -418,7 +513,7 @@ async function savePreview() {
     mode.value = 'saved'
     generatedPng.value = ''
     downloadPng.value = ''
-    savedRevision.value += 1
+    savedRevision.value = updatedPhoto.dithered_updated_at || String(Date.now())
     emit('photo-updated', updatedPhoto)
     emit('notify', result.message || 'Dithered photo saved')
   } catch (saveError) {
@@ -483,9 +578,17 @@ async function updateCarouselSelection(event) {
   }
 }
 
-onMounted(() => document.addEventListener('pointerdown', handleDocumentPointerDown))
+onMounted(() => {
+  document.addEventListener('pointerdown', handleDocumentPointerDown)
+  if (typeof ResizeObserver !== 'undefined') {
+    stageResizeObserver = new ResizeObserver(updateViewportSize)
+    if (stageRef.value) stageResizeObserver.observe(stageRef.value)
+  }
+  nextTick(updateViewportSize)
+})
 onUnmounted(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
+  stageResizeObserver?.disconnect()
   cancelPreviewRequest()
 })
 </script>
@@ -541,57 +644,74 @@ onUnmounted(() => {
       </div>
     </div>
     <div class="preview-panel" role="tabpanel">
-      <div
-        ref="stageRef"
-        class="preview-stage"
-        :class="{ dragging }"
-        :style="stageStyle"
-        @pointerdown="startPan"
-        @pointermove="movePan"
-        @pointerup="stopPan"
-        @pointercancel="stopPan"
-      >
-        <img
-          v-if="imageSource"
-          class="preview-image"
-          :class="{ dithered: tab === 'dithered' }"
-          :src="imageSource"
-          :alt="`${tab} preview of ${photo?.filename || photo?.id}`"
-          v-bind="imageAttributes()"
-          :style="imageStyle"
-          @load="handleImageLoad"
-        />
-        <span v-else class="preview-placeholder">{{ loading ? 'generating preview...' : 'preview unavailable' }}</span>
-      </div>
-      <details v-if="tab === 'dithered'" class="preview-controls-disclosure" :open="ditherControlsOpen" @toggle="ditherControlsOpen = $event.currentTarget.open">
-        <summary class="preview-controls-summary">
-          <span>dither mode</span>
-          <span class="preview-controls-summary-state">{{ modeLabel }}</span>
-        </summary>
-        <div class="preview-controls preview-control-content">
-          <label>
-            dither mode
-            <select v-model="mode" :disabled="sending || saving">
-              <option value="saved" :disabled="!photo?.has_dithered">saved version</option>
-              <option value="floyd_steinberg">floyd steinberg</option>
-              <option value="ordered">ordered (bayer)</option>
-              <option value="bayer_natural_pair">bayer natural pair</option>
-              <option value="gb-default">game boy default</option>
-              <option value="gb-default-color">game boy default (color)</option>
-            </select>
-          </label>
-          <label v-if="mode === 'gb-default-color'">
-            color palette
-            <select v-model="palette" :disabled="sending || saving">
-              <option value="blue_yellow">black / blue / yellow / white</option>
-              <option value="green_yellow">black / green / yellow / white</option>
-              <option value="red_yellow">black / red / yellow / white</option>
-              <option value="blue_red">black / blue / red / white</option>
-              <option value="blue_green">black / blue / green / white</option>
-            </select>
-          </label>
+      <div class="preview-content">
+        <div class="preview-visual">
+          <div
+            ref="stageRef"
+            class="preview-stage"
+            :class="{ dragging }"
+            :style="stageStyle"
+            @pointerdown.prevent="startPan"
+            @pointermove.prevent="movePan"
+            @pointerup="stopPan"
+            @pointercancel="stopPan"
+            @pointerleave="stopPan"
+            @lostpointercapture="stopPan"
+          >
+            <img
+              v-if="imageSource"
+              class="preview-image"
+              :class="{ dithered: tab === 'dithered' }"
+              :src="imageSource"
+              :alt="`${tab} preview of ${photo?.filename || photo?.id}`"
+              draggable="false"
+              v-bind="imageAttributes()"
+              :style="imageStyle"
+              @load="handleImageLoad"
+              @dragstart.prevent
+            />
+            <span v-else class="preview-placeholder">{{ loading ? 'generating preview...' : 'preview unavailable' }}</span>
+          </div>
+          <details v-if="tab === 'dithered'" class="preview-controls-disclosure" :open="ditherControlsOpen" @toggle="ditherControlsOpen = $event.currentTarget.open">
+            <summary class="preview-controls-summary">
+              <span>dither mode</span>
+              <span class="preview-controls-summary-state">{{ modeLabel }}</span>
+            </summary>
+            <div class="preview-controls preview-control-content">
+              <label>
+                dither mode
+                <select v-model="mode" :disabled="sending || saving">
+                  <option value="saved" :disabled="!photo?.has_dithered">saved version</option>
+                  <option value="floyd_steinberg">floyd steinberg</option>
+                  <option value="ordered">ordered (bayer)</option>
+                  <option value="bayer_natural_pair">bayer natural pair</option>
+                  <option value="gb-default">game boy default</option>
+                  <option value="gb-default-color">game boy default (color)</option>
+                </select>
+              </label>
+              <label v-if="mode === 'gb-default-color'">
+                color palette
+                <select v-model="palette" :disabled="sending || saving">
+                  <option value="blue_yellow">black / blue / yellow / white</option>
+                  <option value="green_yellow">black / green / yellow / white</option>
+                  <option value="red_yellow">black / red / yellow / white</option>
+                  <option value="blue_red">black / blue / red / white</option>
+                  <option value="blue_green">black / blue / green / white</option>
+                </select>
+              </label>
+            </div>
+          </details>
         </div>
-      </details>
+        <details class="photo-metadata" :open="metadataOpen" @toggle="metadataOpen = $event.currentTarget.open">
+          <summary>photo information</summary>
+          <dl class="photo-metadata-list">
+            <template v-for="([label, value]) in metadataRows" :key="label">
+              <dt>{{ label }}</dt>
+              <dd :title="value">{{ value }}</dd>
+            </template>
+          </dl>
+        </details>
+      </div>
     </div>
     <p class="dialog-status" role="status" aria-live="polite">{{ error }}</p>
     <div class="dialog-actions">

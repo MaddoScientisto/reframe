@@ -1,5 +1,7 @@
 <script setup>
+import { ref, watch } from 'vue'
 import { ditheredDownloadUrl } from '../api/dashboardApi'
+import { forgetImagePreview, isImagePreviewLoaded, markImagePreviewLoaded } from '../composables/photoPreviewCache'
 
 const props = defineProps({
   photo: { type: Object, required: true },
@@ -8,6 +10,10 @@ const props = defineProps({
 })
 
 defineEmits(['select', 'display', 'extension'])
+
+const imageLoading = ref(true)
+const imageError = ref(false)
+const imageKey = ref(0)
 
 function actionKey(action) {
   return `${action.id}:${props.photo.id}`
@@ -19,6 +25,30 @@ function imageSource(photo) {
   const separator = path.includes('?') ? '&' : '?'
   return `${path}${separator}v=${photo.dithered_updated_at}`
 }
+
+function handleImageLoad() {
+  markImagePreviewLoaded(imageSource(props.photo))
+  imageLoading.value = false
+  imageError.value = false
+}
+
+function handleImageError() {
+  forgetImagePreview(imageSource(props.photo))
+  imageLoading.value = false
+  imageError.value = true
+}
+
+function retryImage() {
+  imageLoading.value = !isImagePreviewLoaded(imageSource(props.photo))
+  imageError.value = false
+  imageKey.value += 1
+}
+
+watch(() => imageSource(props.photo), (source) => {
+  imageLoading.value = Boolean(source) && !isImagePreviewLoaded(source)
+  imageError.value = !source
+  imageKey.value += 1
+}, { immediate: true })
 </script>
 
 <template>
@@ -33,11 +63,23 @@ function imageSource(photo) {
     @keydown.space.prevent="$emit('select', photo)"
   >
     <div class="photo-frame">
+      <div v-if="imageLoading && !imageError" class="image-placeholder" aria-label="Loading image">
+        <span class="loading-spinner"></span>
+      </div>
+      <div v-if="imageError" class="image-error" role="status">
+        <span>image unavailable</span>
+        <button class="pagination-button" type="button" @click.stop="retryImage">retry</button>
+      </div>
       <img
+        v-if="!imageError && imageSource(photo)"
+        :key="imageKey"
         class="photo-image"
+        draggable="false"
         :src="imageSource(photo)"
         :alt="`Photo ${photo.id}`"
-        loading="lazy"
+        :loading="isImagePreviewLoaded(imageSource(photo)) ? 'eager' : 'lazy'"
+        @load="handleImageLoad"
+        @error="handleImageError"
       />
     </div>
     <div class="photo-info">

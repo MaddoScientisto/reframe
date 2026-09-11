@@ -10,8 +10,18 @@ import logging
 import socket
 import base64
 import random
+import hashlib
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from time import sleep
+
+from photo_contract import (
+    CANONICAL_FILENAME_PATTERN,
+    canonical_original_filename,
+    resolve_capture_timestamp,
+    short_content_hash,
+)
 
 # Lazy-loaded by _lazy_import_pil() on first use
 Image = None
@@ -99,8 +109,19 @@ EXIF_ORIENTATION_TAG = 274
 EXIF_SOFTWARE_TAG = 305
 EXIF_DATETIME_TAG = 306
 EXIF_DATETIME_ORIGINAL_TAG = 36867
+EXIF_DATETIME_DIGITIZED_TAG = 36868
+EXIF_OFFSET_TIME_TAG = 36880
+EXIF_OFFSET_TIME_ORIGINAL_TAG = 36881
+EXIF_OFFSET_TIME_DIGITIZED_TAG = 36882
 EXIF_EXPOSURE_TIME_TAG = 33434
 EXIF_ISO_TAG = 34855
+EXIF_EXPOSURE_BIAS_TAG = 37380
+EXIF_SUBJECT_DISTANCE_TAG = 37382
+EXIF_LIGHT_SOURCE_TAG = 37384
+EXIF_WHITE_BALANCE_TAG = 41987
+EXIF_USER_COMMENT_TAG = 37510
+EXIF_PIXEL_X_TAG = 40962
+EXIF_PIXEL_Y_TAG = 40963
 ROTATION_TO_EXIF = {0: 1, 1: 6, 2: 3, 3: 8}
 EXIF_TO_ROTATION = {value: key for key, value in ROTATION_TO_EXIF.items()}
 BUTTON_POLL_INTERVAL_SECONDS = 0.025
@@ -118,6 +139,31 @@ AWB_MODE_VALUES = {
     "custom": 7,
 }
 AWB_MODE_NAMES = {value: name for name, value in AWB_MODE_VALUES.items()}
+AWB_LIGHT_SOURCE_VALUES = {
+    1: 3,   # incandescent
+    2: 3,   # tungsten
+    3: 2,   # fluorescent
+    4: 3,   # indoor
+    5: 1,   # daylight
+    6: 10,  # cloudy weather
+}
+
+def flush_file(path):
+    """Flush file contents before an atomic publication boundary."""
+    with open(path, "rb") as file_handle:
+        os.fsync(file_handle.fileno())
+
+
+def flush_directory(path):
+    """Flush a directory when the host platform exposes directory handles."""
+    try:
+        directory_fd = os.open(path, os.O_RDONLY)
+    except (AttributeError, OSError):
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 # Color palettes for dithering. We blend between the two to create a saturated look while preserving details.
 # Idea from https://github.com/pimoroni/inky
@@ -1538,7 +1584,86 @@ class ImageProcessor:
         return EXIF_TO_ROTATION.get(orientation, 0)
 
     @staticmethod
-    def _exif_for_image(image, source_image=None, rotation=0, metadata=None):
+    def _metadata_json(metadata):
+        return json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=str)
+
+    @staticmethod
+    def _capture_exif_values(capture_time):
+        resolved = resolve_capture_timestamp({}, capture_time).astimezone()
+        timestamp = resolved.strftime("%Y:%m:%d %H:%M:%S")
+        offset = resolved.strftime("%z")
+        offset = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else None
+        return resolved, timestamp, offset
+
+    @staticmethod
+    def _capture_time_from_source(image):
+        """Read the stored capture timestamp when reprocessing an original."""
+        try:
+            exif = image.getexif()
+            timestamp = exif.get(EXIF_DATETIME_ORIGINAL_TAG) or exif.get(EXIF_DATETIME_TAG)
+            if not timestamp:
+                return None
+            resolved = datetime.strptime(str(timestamp), "%Y:%m:%d %H:%M:%S")
+            offset = exif.get(EXIF_OFFSET_TIME_ORIGINAL_TAG) or exif.get(EXIF_OFFSET_TIME_TAG)
+            if offset:
+                sign = 1 if str(offset).startswith("+") else -1
+                hours, minutes = str(offset)[1:].split(":", 1)
+                resolved = resolved.replace(
+                    tzinfo=timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
+                )
+            return resolve_capture_timestamp({}, resolved)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _rational(value, denominator=1_000_000):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        numerator = round(numeric * denominator)
+        if not numerator and numeric:
+            numerator = 1 if numeric > 0 else -1
+        return (numerator, denominator)
+
+    @staticmethod
+    def _exposure_time_rational(exposure_time_us):
+        """Convert Picamera2 microseconds to an EXIF seconds rational."""
+        try:
+            exposure_seconds = float(exposure_time_us) / 1_000_000
+        except (TypeError, ValueError):
+            return None
+        return ImageProcessor._rational(exposure_seconds)
+
+    @staticmethod
+    def _custom_capture_metadata(metadata):
+        if not isinstance(metadata, dict):
+            return {"schema": 1, "sensor": {}}
+        standard_keys = {
+            "ExposureTime", "AnalogueGain", "ExposureValue", "ExposureCompensation",
+            "ExposureCompensationValue", "AwbEnable", "AwbMode", "SubjectDistance",
+            "CalibratedFocusDistance", "CaptureTimestamp", "capture_time",
+        }
+        sensor = {
+            key: value for key, value in metadata.items()
+            if key not in standard_keys and key in {
+                "SensorTimestamp", "FrameDuration", "LensPosition", "AfState", "ColourGains",
+                "AfMode", "AwbMode", "AwbEnable",
+            }
+        }
+        return {"schema": 1, "sensor": sensor}
+
+    @staticmethod
+    def _exif_for_image(
+        image,
+        source_image=None,
+        rotation=0,
+        metadata=None,
+        capture_time=None,
+    ):
+        metadata = metadata if isinstance(metadata, dict) else {}
         exif = image.getexif()
         if source_image is not None:
             try:
@@ -1549,23 +1674,64 @@ class ImageProcessor:
 
         exif[EXIF_ORIENTATION_TAG] = ROTATION_TO_EXIF[rotation]
         exif[EXIF_SOFTWARE_TAG] = "reFrame"
-        timestamp = time.strftime("%Y:%m:%d %H:%M:%S", time.localtime())
-        exif.setdefault(EXIF_DATETIME_TAG, timestamp)
-        exif.setdefault(EXIF_DATETIME_ORIGINAL_TAG, timestamp)
-        if isinstance(metadata, dict):
-            exposure_time = metadata.get("ExposureTime")
-            if exposure_time is not None:
-                try:
-                    exif[EXIF_EXPOSURE_TIME_TAG] = (int(float(exposure_time)), 1_000_000)
-                except (TypeError, ValueError):
-                    pass
-            analogue_gain = metadata.get("AnalogueGain")
-            if analogue_gain is not None:
-                try:
-                    exif[EXIF_ISO_TAG] = max(1, round(float(analogue_gain) * 100))
-                except (TypeError, ValueError):
-                    pass
-        return exif
+        resolved, timestamp, offset = ImageProcessor._capture_exif_values(
+            capture_time or metadata.get("CaptureTimestamp") or metadata.get("capture_time")
+        )
+        exif[EXIF_DATETIME_TAG] = timestamp
+        exif[EXIF_DATETIME_ORIGINAL_TAG] = timestamp
+        exif[EXIF_DATETIME_DIGITIZED_TAG] = timestamp
+        if offset:
+            exif[EXIF_OFFSET_TIME_TAG] = offset
+            exif[EXIF_OFFSET_TIME_ORIGINAL_TAG] = offset
+            exif[EXIF_OFFSET_TIME_DIGITIZED_TAG] = offset
+
+        exposure_time = ImageProcessor._exposure_time_rational(metadata.get("ExposureTime"))
+        if exposure_time and exposure_time[0] > 0:
+            exif[EXIF_EXPOSURE_TIME_TAG] = exposure_time
+        analogue_gain = metadata.get("AnalogueGain")
+        iso_calibration = metadata.get("IsoCalibration", metadata.get("iso_calibration", 100))
+        try:
+            if analogue_gain is not None and float(analogue_gain) > 0 and float(iso_calibration) > 0:
+                exif[EXIF_ISO_TAG] = max(1, round(float(analogue_gain) * float(iso_calibration)))
+        except (TypeError, ValueError):
+            pass
+
+        exposure_bias = metadata.get("ExposureValue", metadata.get("ExposureCompensation"))
+        if exposure_bias is None:
+            exposure_bias = metadata.get("ExposureCompensationValue")
+        exposure_bias_value = ImageProcessor._rational(exposure_bias, 1000)
+        if exposure_bias_value:
+            exif[EXIF_EXPOSURE_BIAS_TAG] = exposure_bias_value
+
+        awb_mode = metadata.get("AwbMode")
+        if isinstance(metadata.get("AwbEnable"), bool):
+            exif[EXIF_WHITE_BALANCE_TAG] = 0 if metadata["AwbEnable"] else 1
+        if awb_mode in AWB_LIGHT_SOURCE_VALUES:
+            exif[EXIF_LIGHT_SOURCE_TAG] = AWB_LIGHT_SOURCE_VALUES[awb_mode]
+
+        focus_distance = metadata.get("SubjectDistance", metadata.get("CalibratedFocusDistance"))
+        focus_value = ImageProcessor._rational(focus_distance, 1000)
+        if focus_value and focus_value[0] >= 0:
+            exif[EXIF_SUBJECT_DISTANCE_TAG] = focus_value
+        exif[EXIF_PIXEL_X_TAG] = int(image.width)
+        exif[EXIF_PIXEL_Y_TAG] = int(image.height)
+        exif[EXIF_USER_COMMENT_TAG] = (
+            b"UNICODE\x00" + ImageProcessor._metadata_json(
+                ImageProcessor._custom_capture_metadata(metadata)
+            ).encode("utf-8")
+        )
+        return exif, resolved
+
+    @staticmethod
+    def build_processing_metadata(photo_id, dithering_method, gb_color_palette, settings=None):
+        processing_settings = dict(settings or {})
+        processing_settings.setdefault("gb_color_palette", gb_color_palette)
+        return {
+            "schema": 1,
+            "source_photo_id": photo_id,
+            "dithering_method": dithering_method,
+            "processing_settings": processing_settings,
+        }
 
     @staticmethod
     def save_image_with_metadata(
@@ -1576,15 +1742,20 @@ class ImageProcessor:
         metadata=None,
         dithering_method=None,
         gb_color_palette=None,
+        capture_time=None,
+        processing_metadata=None,
     ):
         Image, _ = _lazy_import_pil()
-        exif = ImageProcessor._exif_for_image(
+        exif, resolved_capture_time = ImageProcessor._exif_for_image(
             image,
             source_image=source_image,
             rotation=rotation,
             metadata=metadata,
+            capture_time=capture_time,
         )
         save_kwargs = {"exif": exif.tobytes()}
+        if source_image is not None and source_image.info.get("icc_profile"):
+            save_kwargs["icc_profile"] = source_image.info["icc_profile"]
         if output_path.lower().endswith(".png"):
             from PIL.PngImagePlugin import PngInfo
 
@@ -1593,6 +1764,20 @@ class ImageProcessor:
                 png_info.add_text("reframe:dithering_method", str(dithering_method))
             if gb_color_palette:
                 png_info.add_text("reframe:gb_color_palette", str(gb_color_palette))
+            png_info.add_text("reframe:metadata_schema", "1")
+            png_info.add_text(
+                "reframe:capture_metadata",
+                ImageProcessor._metadata_json({
+                    "schema": 1,
+                    "capture_time": resolved_capture_time.isoformat(),
+                    "sensor": ImageProcessor._custom_capture_metadata(metadata).get("sensor", {}),
+                }),
+            )
+            if processing_metadata:
+                png_info.add_text(
+                    "reframe:processing_metadata",
+                    ImageProcessor._metadata_json(processing_metadata),
+                )
             save_kwargs["pnginfo"] = png_info
             image.save(output_path, format="PNG", **save_kwargs)
         else:
@@ -1607,6 +1792,8 @@ class ImageProcessor:
         metadata=None,
         dithering_method=None,
         gb_color_palette=None,
+        capture_time=None,
+        processing_metadata=None,
     ):
         temp_path = f"{output_path}.tmp-{os.getpid()}-{threading.get_ident()}{os.path.splitext(output_path)[1]}"
         try:
@@ -1618,6 +1805,8 @@ class ImageProcessor:
                 metadata=metadata,
                 dithering_method=dithering_method,
                 gb_color_palette=gb_color_palette,
+                capture_time=capture_time,
+                processing_metadata=processing_metadata,
             )
             os.replace(temp_path, output_path)
         finally:
@@ -1656,6 +1845,9 @@ class ImageProcessor:
                     "rotation": ImageProcessor.rotation_from_exif(image),
                     "dithering_method": image.info.get("reframe:dithering_method"),
                     "gb_color_palette": image.info.get("reframe:gb_color_palette"),
+                    "metadata_schema": image.info.get("reframe:metadata_schema"),
+                    "capture_metadata": image.info.get("reframe:capture_metadata"),
+                    "processing_metadata": image.info.get("reframe:processing_metadata"),
                 }
         except (OSError, ValueError):
             return {"rotation": 0, "dithering_method": None, "gb_color_palette": None}
@@ -2418,23 +2610,33 @@ class ImageProcessor:
             )
 
     @staticmethod
-    def process_photo_with_settings(original_path, output_path, processing_settings):
+    def process_photo_with_settings(original_path, output_path, processing_settings, photo_id=None):
         """Process a photo with specific settings and save it."""
         try:
             Image, _ = _lazy_import_pil()
             rotation = ImageProcessor.read_dithered_metadata(output_path).get("rotation", 0)
             with Image.open(original_path) as original_image:
+                capture_time = ImageProcessor._capture_time_from_source(original_image)
                 dithered_image = ImageProcessor.render_photo_with_settings(
                     original_path, processing_settings
+                )
+                processing_metadata = ImageProcessor.build_processing_metadata(
+                    photo_id or os.path.splitext(os.path.basename(original_path))[0],
+                    processing_settings.get("dithering_method"),
+                    processing_settings.get("gb_color_palette"),
+                    processing_settings,
                 )
                 ImageProcessor.save_dithered_image(
                     dithered_image,
                     output_path,
                     source_image=original_image,
                     rotation=rotation,
+                    capture_time=capture_time,
                     dithering_method=processing_settings.get("dithering_method"),
                     gb_color_palette=processing_settings.get("gb_color_palette"),
+                    processing_metadata=processing_metadata,
                 )
+                dithered_image.close()
             logging.info(f"Processed image saved to {output_path}")
 
             return {
@@ -2461,18 +2663,18 @@ class ImageProcessor:
         gb_color_palette="blue_yellow",
         photos_path=SAVE_PATH,
         output_path=PROCESSED_PATH,
+        file_manager=None,
     ):
         Image, _ = _lazy_import_pil()
-        original_path = None
-        for extension in ("png", "jpg", "jpeg"):
-            candidate = os.path.join(photos_path, f"{photo_id}.{extension}")
-            if os.path.exists(candidate):
-                original_path = candidate
-                break
-        if not original_path:
+        manager = file_manager or FileManager(photos_path, output_path)
+        photo_info = manager.get_photo_info(photo_id)
+        if not photo_info:
             return {"success": False, "error": "Original photo not found", "message": "Photo not found"}
+        original_path = photo_info["original_path"]
 
-        dithered_path = os.path.join(output_path, f"{photo_id}_dithered.png")
+        dithered_path = photo_info.get("dithered_path") or os.path.join(
+            output_path, f"{photo_info['id']}_dithered.png"
+        )
         try:
             if encoded_png:
                 with Image.open(BytesIO(base64.b64decode(encoded_png, validate=True))) as preview:
@@ -2491,8 +2693,14 @@ class ImageProcessor:
                     dithered_path,
                     source_image=original_image,
                     rotation=rotation,
+                    capture_time=ImageProcessor._capture_time_from_source(original_image),
                     dithering_method=dithering_method,
                     gb_color_palette=gb_color_palette,
+                    processing_metadata=ImageProcessor.build_processing_metadata(
+                        photo_info["id"],
+                        dithering_method,
+                        gb_color_palette,
+                    ),
                 )
             dithered_image.close()
         except (OSError, ValueError, TypeError) as error:
@@ -2500,7 +2708,7 @@ class ImageProcessor:
 
         return {
             "success": True,
-            "photo_id": photo_id,
+            "photo_id": photo_info["id"],
             "processed_path": dithered_path,
             "rotation": rotation,
             "dithering_method": dithering_method,
@@ -2509,27 +2717,33 @@ class ImageProcessor:
         }
 
     @staticmethod
-    def reprocess_photo_by_id(photo_id, processing_settings, photos_path=SAVE_PATH, output_path=PROCESSED_PATH):
+    def reprocess_photo_by_id(
+        photo_id,
+        processing_settings,
+        photos_path=SAVE_PATH,
+        output_path=PROCESSED_PATH,
+        file_manager=None,
+    ):
         """Reprocess an existing photo by ID with new settings."""
-        # Find the original photo
-        original_path = None
-        for ext in ['png', 'jpg', 'jpeg']:
-            test_path = os.path.join(photos_path, f"{photo_id}.{ext}")
-            if os.path.exists(test_path):
-                original_path = test_path
-                break
-
-        if not original_path:
+        manager = file_manager or FileManager(photos_path, output_path)
+        photo_info = manager.get_photo_info(photo_id)
+        if not photo_info:
             return {
                 "success": False,
                 "error": "Original photo not found",
                 "message": f"Could not find original photo for ID: {photo_id}"
             }
 
-        # Generate output path
-        output_file_path = os.path.join(output_path, f"{photo_id}_dithered.png")
+        output_file_path = photo_info.get("dithered_path") or os.path.join(
+            output_path, f"{photo_info['id']}_dithered.png"
+        )
 
-        return ImageProcessor.process_photo_with_settings(original_path, output_file_path, processing_settings)
+        return ImageProcessor.process_photo_with_settings(
+            photo_info["original_path"],
+            output_file_path,
+            processing_settings,
+            photo_id=photo_info["id"],
+        )
 
 
 class FileManager:
@@ -2541,7 +2755,19 @@ class FileManager:
         os.makedirs(save_path, exist_ok=True)
         os.makedirs(processed_path, exist_ok=True)
         self._id_lock = threading.Lock()
+        self._recover_temporary_files()
         self._next_photo_index = self._find_next_photo_index()
+
+    def _recover_temporary_files(self):
+        for directory in (self.save_path, self.processed_path):
+            try:
+                for path in os.scandir(directory):
+                    if path.is_file() and (
+                        path.name.startswith(".capture-") or ".tmp-" in path.name
+                    ):
+                        os.unlink(path.path)
+            except OSError as error:
+                logging.warning("Could not recover temporary photo files: %s", error)
 
     def _find_next_photo_index(self):
         """Seed the monotonic photo counter from numeric filenames on disk."""
@@ -2553,6 +2779,10 @@ class FileManager:
                     continue
                 if stem.isdigit():
                     highest_index = max(highest_index, int(stem))
+                    continue
+                match = CANONICAL_FILENAME_PATTERN.match(stem)
+                if match:
+                    highest_index = max(highest_index, int(match.group("sequence")))
         except OSError as e:
             logging.warning(f"Could not scan existing photo IDs: {e}")
         return highest_index + 1
@@ -2567,6 +2797,35 @@ class FileManager:
             self._next_photo_index += 1
         return os.path.join(folder, f"{str(index).zfill(5)}.{extension}")
 
+    def reserve_capture(self, extension="jpg"):
+        """Reserve a sequence number and return a private temporary path."""
+        with self._id_lock:
+            sequence = self._next_photo_index
+            self._next_photo_index += 1
+        temporary_name = f".capture-{sequence:05d}-{os.getpid()}-{threading.get_ident()}.tmp.{extension.lstrip('.') }"
+        return sequence, os.path.join(self.save_path, temporary_name)
+
+    def canonical_path_for_bytes(self, sequence, capture_time, content, extension="jpg"):
+        """Resolve a canonical path, extending the hash if a short collision exists."""
+        full_digest = hashlib.sha256(bytes(content)).hexdigest()
+        filename, photo_id = canonical_original_filename(
+            sequence, capture_time, content, extension=extension, hash_length=8
+        )
+        candidate = os.path.join(self.save_path, filename)
+        if os.path.exists(candidate):
+            try:
+                existing_digest = hashlib.sha256(Path(candidate).read_bytes()).hexdigest()
+            except OSError as error:
+                raise OSError(f"Could not verify hash collision for {candidate}: {error}") from error
+            if existing_digest != full_digest:
+                filename, photo_id = canonical_original_filename(
+                    sequence, capture_time, content, extension=extension, hash_length=16
+                )
+                candidate = os.path.join(self.save_path, filename)
+                if os.path.exists(candidate) and hashlib.sha256(Path(candidate).read_bytes()).hexdigest() != full_digest:
+                    raise FileExistsError(f"Content hash collision for {photo_id}")
+        return candidate, photo_id
+
     def save_image(self, image, folder, extension="png"):
         """Saves the image to a unique file in the specified folder."""
         file_path = self.get_new_file_path(folder, extension)
@@ -2575,23 +2834,75 @@ class FileManager:
         logging.info(f"Image saved to {file_path}")
         return file_path
 
-    def get_photo_info(self, photo_id):
-        """Get information about a specific photo by ID."""
-        # Find original photo
-        original_path = None
-        for ext in ['png', 'jpg', 'jpeg']:
-            test_path = os.path.join(self.save_path, f"{photo_id}.{ext}")
-            if os.path.exists(test_path):
-                original_path = test_path
-                break
+    @staticmethod
+    def _identity_for_filename(filename):
+        stem = os.path.splitext(os.path.basename(filename))[0]
+        match = CANONICAL_FILENAME_PATTERN.match(stem)
+        if match:
+            return {
+                "id": match.group("photo_id"),
+                "id_kind": "content_hash",
+                "legacy_id": None,
+            }
+        return {"id": stem, "id_kind": "legacy", "legacy_id": stem}
 
+    def _find_original_path(self, photo_id):
+        if not photo_id or os.path.basename(photo_id) != photo_id:
+            return None
+        candidates = []
+        try:
+            candidates = [
+                entry for entry in os.scandir(self.save_path)
+                if entry.is_file() and Path(entry.name).suffix.lower() in {".png", ".jpg", ".jpeg"}
+            ]
+        except OSError:
+            return None
+        for entry in candidates:
+            identity = self._identity_for_filename(entry.name)
+            if identity["id"] == photo_id or identity["legacy_id"] == photo_id:
+                return entry.path
+        return None
+
+    def _find_dithered_path(self, original_path, photo_id):
+        original_name = os.path.basename(original_path)
+        original_stem = os.path.splitext(original_name)[0]
+        candidates = [
+            f"{photo_id}_dithered.png",
+            f"{photo_id}_dithered.jpg",
+            f"{original_stem}_dithered.png",
+            f"{original_stem}_dithered.jpg",
+            original_name,
+        ]
+        for filename in dict.fromkeys(candidates):
+            path = os.path.join(self.processed_path, filename)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _photo_entries(self):
+        """Return candidate originals ordered without opening image files."""
+        try:
+            entries = [
+                entry for entry in os.scandir(self.save_path)
+                if entry.is_file() and Path(entry.name).suffix.lower() in {".png", ".jpg", ".jpeg"}
+            ]
+            return sorted(entries, key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        except OSError as error:
+            logging.error(f"Error scanning photos: {error}")
+            return []
+
+    def get_photo_info(self, photo_id, original_path=None):
+        """Get information about a specific photo by ID."""
+        if original_path is None:
+            original_path = self._find_original_path(photo_id)
         if not original_path:
             return None
 
         try:
-            # Check for dithered version
-            dithered_path = os.path.join(self.processed_path, f"{photo_id}_dithered.png")
-            has_dithered = os.path.exists(dithered_path)
+            identity = self._identity_for_filename(original_path)
+            resolved_id = identity["id"]
+            dithered_path = self._find_dithered_path(original_path, resolved_id)
+            has_dithered = dithered_path is not None
             dithered_metadata = ImageProcessor.read_dithered_metadata(dithered_path) if has_dithered else {}
             dithered_updated_at = os.stat(dithered_path).st_mtime_ns if has_dithered else None
 
@@ -2599,7 +2910,9 @@ class FileManager:
             original_stat = os.stat(original_path)
 
             return {
-                "id": photo_id,
+                "id": resolved_id,
+                "id_kind": identity["id_kind"],
+                "legacy_id": identity["legacy_id"],
                 "original_path": original_path,
                 "dithered_path": dithered_path if has_dithered else None,
                 "has_dithered": has_dithered,
@@ -2607,8 +2920,10 @@ class FileManager:
                 "rotation": dithered_metadata.get("rotation", 0),
                 "dithering_method": dithered_metadata.get("dithering_method"),
                 "gb_color_palette": dithered_metadata.get("gb_color_palette"),
+                "processing_metadata": dithered_metadata.get("processing_metadata"),
                 "file_size": original_stat.st_size,
                 "created_at": original_stat.st_mtime,
+                "capture_time": dithered_metadata.get("capture_metadata"),
                 "filename": os.path.basename(original_path)
             }
         except OSError as e:
@@ -2619,42 +2934,76 @@ class FileManager:
         """List all photos with their information."""
         photos = []
 
-        # Get all files from the save directory
-        try:
-            files = os.listdir(self.save_path)
-            photo_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-
-            for filename in sorted(photo_files, reverse=True):  # Newest first
-                photo_id = os.path.splitext(filename)[0]
-                photo_info = self.get_photo_info(photo_id)
-                if photo_info:
-                    photos.append(photo_info)
-
-        except Exception as e:
-            logging.error(f"Error listing photos: {e}")
+        seen_paths = set()
+        for entry in self._photo_entries():
+            photo_id = self._identity_for_filename(entry.name)["id"]
+            photo_info = self.get_photo_info(photo_id, original_path=entry.path)
+            if photo_info and photo_info["original_path"] not in seen_paths:
+                seen_paths.add(photo_info["original_path"])
+                photos.append(photo_info)
 
         return photos
+
+    def list_photo_page(self, page=1, limit=20, photo_ids=None):
+        """Return one page while reading image metadata only for its records."""
+        page = max(1, int(page or 1))
+        limit = max(1, min(int(limit or 20), 100))
+        allowed_ids = set(photo_ids) if photo_ids is not None else None
+        entries = self._photo_entries()
+        if allowed_ids is not None:
+            entries = [
+                entry for entry in entries
+                if (
+                    self._identity_for_filename(entry.name)["id"] in allowed_ids
+                    or self._identity_for_filename(entry.name)["legacy_id"] in allowed_ids
+                )
+            ]
+
+        total_photos = len(entries)
+        total_pages = max(1, (total_photos + limit - 1) // limit)
+        page = min(page, total_pages)
+        start = (page - 1) * limit
+        photos = []
+        seen_paths = set()
+        for entry in entries[start:start + limit]:
+            photo_id = self._identity_for_filename(entry.name)["id"]
+            photo_info = self.get_photo_info(photo_id, original_path=entry.path)
+            if photo_info and photo_info["original_path"] not in seen_paths:
+                seen_paths.add(photo_info["original_path"])
+                photos.append(photo_info)
+
+        return {
+            "photos": photos,
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total_photos": total_photos,
+                "total_pages": total_pages,
+                "has_prev": page > 1,
+                "has_next": page < total_pages,
+            },
+        }
 
     def delete_photo(self, photo_id):
         """Delete both original and processed versions of a photo."""
         deleted_files = []
 
-        # Delete original
-        for ext in ['png', 'jpg', 'jpeg']:
-            original_path = os.path.join(self.save_path, f"{photo_id}.{ext}")
-            if os.path.exists(original_path):
-                os.remove(original_path)
-                deleted_files.append(original_path)
-                break
+        original_path = self._find_original_path(photo_id)
+        if original_path and os.path.exists(original_path):
+            os.remove(original_path)
+            deleted_files.append(original_path)
 
-        # Delete processed version
-        # Delete processed version (both png and legacy jpg)
-        dithered_png = os.path.join(self.processed_path, f"{photo_id}_dithered.png")
-        dithered_jpg = os.path.join(self.processed_path, f"{photo_id}_dithered.jpg")
-        for p in (dithered_png, dithered_jpg):
-            if os.path.exists(p):
-                os.remove(p)
-                deleted_files.append(p)
+        if original_path:
+            original_stem = os.path.splitext(os.path.basename(original_path))[0]
+            for name in {
+                f"{photo_id}_dithered.png", f"{photo_id}_dithered.jpg",
+                f"{original_stem}_dithered.png", f"{original_stem}_dithered.jpg",
+                os.path.basename(original_path),
+            }:
+                processed_file = os.path.join(self.processed_path, name)
+                if os.path.exists(processed_file):
+                    os.remove(processed_file)
+                    deleted_files.append(processed_file)
 
         if deleted_files:
             logging.info(f"Deleted photo {photo_id}: {deleted_files}")
@@ -3257,13 +3606,16 @@ class CameraSystem:
     def capture_photo_api(self, fast_mode=False):
         """API-style photo capture with optimized display pipeline.
 
-        Pipeline: capture to memory → dither+buffer → async display → background file save.
-        This minimizes the delay between shutter press and the display starting to refresh.
+        Pipeline: capture to memory -> durable original -> durable dither -> display.
         """
         self.stop_carousel()
+        temporary_original = None
+        temporary_dithered = None
+        original_image = None
+        dithered_image = None
         try:
-            photo_path = self.file_manager.get_new_file_path(SAVE_PATH, ORIGINAL_CAPTURE_EXTENSION)
-            logging.info(f"Capturing photo to: {photo_path}")
+            sequence, temporary_original = self.file_manager.reserve_capture(ORIGINAL_CAPTURE_EXTENSION)
+            logging.info("Capturing photo sequence %s to temporary path", sequence)
 
             display_settings = self.camera_manager.settings.get("display", {})
             if display_settings.get("auto_display", True):
@@ -3272,15 +3624,39 @@ class CameraSystem:
                 self.eink_display.prepare_async()
 
             pipeline_start = time.monotonic()
-            result, original_image = self.camera_manager.capture_image_with_metadata(photo_path, fast_mode=fast_mode)
+            result, original_image = self.camera_manager.capture_image_with_metadata(
+                temporary_original, fast_mode=fast_mode
+            )
 
             if result["success"]:
-                capture_time = time.monotonic()
-                logging.info(f"Photo captured successfully: {result['photo_id']} "
-                             f"({((capture_time - pipeline_start)*1000):.0f}ms)")
+                capture_metadata = dict(original_image.info.get("reframe_capture_metadata", {}))
+                resolved_capture_time = resolve_capture_timestamp(capture_metadata)
+                ImageProcessor.save_image_with_metadata(
+                    original_image,
+                    temporary_original,
+                    metadata=capture_metadata,
+                    capture_time=resolved_capture_time,
+                )
+                original_bytes = Path(temporary_original).read_bytes()
+                photo_path, photo_id = self.file_manager.canonical_path_for_bytes(
+                    sequence,
+                    resolved_capture_time,
+                    original_bytes,
+                    ORIGINAL_CAPTURE_EXTENSION,
+                )
+                os.replace(temporary_original, photo_path)
+                temporary_original = None
+                flush_file(photo_path)
+                flush_directory(SAVE_PATH)
+                logging.info(
+                    "Photo captured successfully: %s (%0.fms)",
+                    photo_id,
+                    (time.monotonic() - pipeline_start) * 1000,
+                )
 
                 processing_settings = self.camera_manager.settings.get("processing", {})
-                dithered_path = os.path.join(PROCESSED_PATH, f"{result['photo_id']}_dithered.png")
+                dithered_path = os.path.join(PROCESSED_PATH, f"{photo_id}_dithered.png")
+                temporary_dithered = f"{dithered_path}.tmp-{os.getpid()}-{threading.get_ident()}.png"
 
                 resized_image = ImageProcessor.resize_image(original_image)
 
@@ -3297,10 +3673,36 @@ class CameraSystem:
                     gb_color_palette=processing_settings.get("gb_color_palette", "blue_yellow")
                 )
 
-                process_time = time.monotonic()
-                logging.info(f"Dither+buffer complete ({((process_time - capture_time)*1000):.0f}ms)")
+                processing_metadata = ImageProcessor.build_processing_metadata(
+                    photo_id,
+                    processing_settings.get("dithering_method"),
+                    processing_settings.get("gb_color_palette"),
+                    processing_settings,
+                )
+                ImageProcessor.save_dithered_image(
+                    dithered_image,
+                    temporary_dithered,
+                    source_image=original_image,
+                    metadata=capture_metadata,
+                    dithering_method=processing_settings.get("dithering_method"),
+                    gb_color_palette=processing_settings.get("gb_color_palette"),
+                    capture_time=resolved_capture_time,
+                    processing_metadata=processing_metadata,
+                )
+                os.replace(temporary_dithered, dithered_path)
+                temporary_dithered = None
+                flush_file(dithered_path)
+                flush_directory(PROCESSED_PATH)
 
-                # Send to display ASAP (async — screen starts blinking immediately)
+                result.update({
+                    "photo_id": photo_id,
+                    "original_path": photo_path,
+                    "processed_path": dithered_path,
+                    "file_size": os.path.getsize(photo_path),
+                    "capture_time": resolved_capture_time.isoformat(),
+                    "filename": os.path.basename(photo_path),
+                })
+
                 if display_settings.get("auto_display", True):
                     if (
                         display_settings.get("interrupt_refresh_on_capture", False)
@@ -3310,41 +3712,14 @@ class CameraSystem:
                         interrupt_result = self.eink_display.interrupt_refresh(interrupt_action)
                         if not interrupt_result.get("success"):
                             logging.error("Could not interrupt display refresh: %s", interrupt_result.get("message"))
-                    logging.info("Sending to display (async)")
                     display_result = self.eink_display.display_buffer_async(display_buffer)
                     if not display_result.get("success"):
-                        logging.warning("Could not send photo to display: %s", display_result.get("message"))
                         result["display_error"] = display_result.get("message")
 
-                display_sent_time = time.monotonic()
-                logging.info(f"Total button-to-display: {((display_sent_time - pipeline_start)*1000):.0f}ms")
-
-                # Save files in background after the display refresh has been dispatched.
-                result["processed_path"] = dithered_path
-                def _save_outputs():
-                    try:
-                        capture_metadata = original_image.info.get("reframe_capture_metadata", {})
-                        ImageProcessor.save_image_with_metadata(
-                            original_image,
-                            photo_path,
-                            metadata=capture_metadata,
-                        )
-                        result["file_size"] = os.path.getsize(photo_path)
-                        logging.info(f"Original JPEG saved: {photo_path}")
-                        ImageProcessor.save_dithered_image(
-                            dithered_image,
-                            dithered_path,
-                            source_image=original_image,
-                            metadata=capture_metadata,
-                            dithering_method=processing_settings.get("dithering_method"),
-                            gb_color_palette=processing_settings.get("gb_color_palette"),
-                        )
-                        logging.info(f"Dithered PNG saved: {dithered_path}")
-                    except Exception as e:
-                        logging.error(f"Error saving photo outputs: {e}")
-
-                save_thread = threading.Thread(target=_save_outputs, daemon=True)
-                save_thread.start()
+                logging.info(
+                    "Durable capture button-to-display: %0.fms",
+                    (time.monotonic() - pipeline_start) * 1000,
+                )
 
             return result
 
@@ -3355,6 +3730,19 @@ class CameraSystem:
                 "error": str(e),
                 "message": f"Photo capture failed: {str(e)}"
             }
+        finally:
+            for temporary_path in (temporary_original, temporary_dithered):
+                if temporary_path:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+            for image in (dithered_image, original_image):
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
 
     def display_photo_api(self, photo_id):
         """API-style photo display."""
@@ -3369,7 +3757,11 @@ class CameraSystem:
         if processing_settings is None:
             processing_settings = self.camera_manager.settings.get("processing", {})
 
-        return ImageProcessor.reprocess_photo_by_id(photo_id, processing_settings)
+        return ImageProcessor.reprocess_photo_by_id(
+            photo_id,
+            processing_settings,
+            file_manager=self.file_manager,
+        )
 
     def save_photo_api(
         self,
@@ -3385,11 +3777,19 @@ class CameraSystem:
             rotation=rotation,
             dithering_method=dithering_method,
             gb_color_palette=gb_color_palette,
+            file_manager=self.file_manager,
         )
 
-    def list_photos_api(self):
-        """API-style photo listing."""
-        return self.file_manager.list_all_photos()
+    def list_photos_api(self, page=None, limit=None, carousel_only=False):
+        """API-style photo listing, optionally limited to one page."""
+        if page is None and limit is None and not carousel_only:
+            return self.file_manager.list_all_photos()
+        carousel_ids = self.camera_manager.settings.get("carousel", {}).get("photo_ids", [])
+        return self.file_manager.list_photo_page(
+            page=page or 1,
+            limit=limit or 20,
+            photo_ids=carousel_ids if carousel_only else None,
+        )
 
     def get_photo_info_api(self, photo_id):
         """API-style photo info retrieval."""
@@ -3791,13 +4191,17 @@ def _create_fastapi_routes():
         return result
 
     @app.get("/api/photos")
-    def api_list_photos():
+    def api_list_photos(
+        page: Optional[int] = None,
+        limit: Optional[int] = None,
+        carousel_only: bool = False,
+    ):
         global camera_system
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
         camera_system.update_activity()
         try:
-            return camera_system.list_photos_api()
+            return camera_system.list_photos_api(page, limit, carousel_only)
         except Exception as e:
             logging.warning(f"Error listing photos (may be mid-processing): {e}")
             return []  # Return empty list; dashboard will retry

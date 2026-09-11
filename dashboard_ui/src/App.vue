@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import AppHeader from './components/AppHeader.vue'
 import LivePreviewDialog from './components/LivePreviewDialog.vue'
 import PhotoGallery from './components/PhotoGallery.vue'
 import PhotoPreviewDialog from './components/PhotoPreviewDialog.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import { useLongRunningJob } from './composables/useLongRunningJob'
+import { usePhotoGallery } from './composables/usePhotoGallery'
 import {
   abortDelete,
   abortDownload,
@@ -18,7 +19,6 @@ import {
   getDeleteProgress,
   getDownloadProgress,
   getExtensionActions,
-  getPhotos,
   getSettings,
   installUpdate,
   resetTimeout,
@@ -31,17 +31,10 @@ import {
   stopCarousel,
 } from './api/dashboardApi'
 
-const photosPerPage = 12
-const initialPage = Number.parseInt(new URLSearchParams(window.location.search).get('page'), 10)
 const initialView = new URLSearchParams(window.location.search).get('view') === 'carousel'
-const currentPage = ref(Number.isInteger(initialPage) && initialPage > 0 ? initialPage : 1)
 const carouselOnly = ref(initialView)
-const photos = ref([])
-const pagination = ref({ total_pages: 1, total_photos: 0, has_prev: false, has_next: false, limit: photosPerPage })
 const extensionActions = ref([])
-const galleryLoading = ref(false)
-const galleryError = ref('')
-const latestPhotoLoadRequest = ref(0)
+const gallery = reactive(usePhotoGallery(carouselOnly))
 const batteryLevel = ref(null)
 const captureBusy = ref(false)
 const carouselActive = ref(false)
@@ -91,15 +84,6 @@ function notify(message, type = 'info') {
   }, 4500)
 }
 
-function updatePageUrl() {
-  const url = new URL(window.location.href)
-  if (currentPage.value === 1) url.searchParams.delete('page')
-  else url.searchParams.set('page', currentPage.value)
-  if (carouselOnly.value) url.searchParams.set('view', 'carousel')
-  else url.searchParams.delete('view')
-  window.history.replaceState({}, '', url)
-}
-
 async function notifyUserActivity() {
   try {
     await resetTimeout()
@@ -117,37 +101,11 @@ async function loadExtensionActions() {
   }
 }
 
-async function loadPhotos(page = currentPage.value) {
-  const requestedPage = Math.max(1, Number.parseInt(page, 10) || 1)
-  const requestId = latestPhotoLoadRequest.value + 1
-  latestPhotoLoadRequest.value = requestId
-  galleryLoading.value = true
-  galleryError.value = ''
-  await loadExtensionActions()
-  try {
-    const result = await getPhotos(requestedPage, photosPerPage, carouselOnly.value)
-    if (requestId !== latestPhotoLoadRequest.value) return
-    const totalPages = Math.max(1, result.pagination?.total_pages || 1)
-    if (requestedPage > totalPages) {
-      await loadPhotos(totalPages)
-      return
-    }
-    photos.value = result.photos || []
-    pagination.value = result.pagination || pagination.value
-    currentPage.value = requestedPage
-    updatePageUrl()
-  } catch (error) {
-    if (requestId === latestPhotoLoadRequest.value) galleryError.value = error.message || 'Could not load photos'
-  } finally {
-    if (requestId === latestPhotoLoadRequest.value) galleryLoading.value = false
-  }
-}
-
 function configureRefreshTimer() {
   clearInterval(refreshTimer)
   refreshTimer = null
   const seconds = Number(settings.value?.system?.auto_refresh_interval)
-  if (seconds > 0) refreshTimer = setInterval(() => loadPhotos(currentPage.value), seconds * 1000)
+  if (seconds > 0) refreshTimer = setInterval(() => gallery.refresh(), seconds * 1000)
 }
 
 async function loadInitialSettings() {
@@ -189,7 +147,7 @@ async function handleSaveSettings(payload) {
     settingsOpen.value = false
     configureRefreshTimer()
     await loadExtensionActions()
-    await loadPhotos(currentPage.value)
+    await gallery.invalidate()
     notify('Settings saved successfully', 'success')
   } catch (error) {
     notify(error.message || 'Could not save settings', 'error')
@@ -205,7 +163,7 @@ async function handleCapture() {
   try {
     const result = await capturePhoto()
     notify(result.message || 'Capture complete', 'success')
-    await loadPhotos(currentPage.value)
+    await gallery.invalidate()
   } catch (error) {
     notify(error.message || 'Could not capture photo', 'error')
   } finally {
@@ -273,62 +231,38 @@ function closePreview() {
 }
 
 async function handlePhotoUpdated(updatedPhoto) {
-  photos.value = photos.value.map((photo) => (
-    photo.id === updatedPhoto.id ? { ...photo, ...updatedPhoto } : photo
-  ))
+  gallery.patchPhoto(updatedPhoto)
   if (selectedPhoto.value?.id === updatedPhoto.id) {
     selectedPhoto.value = { ...selectedPhoto.value, ...updatedPhoto }
   }
-  void loadPhotos(currentPage.value)
+  await gallery.invalidate()
 }
 
 async function handlePhotoDeleted(photoId) {
-  const wasVisible = photos.value.some((photo) => photo.id === photoId)
-  if (wasVisible) {
-    photos.value = photos.value.filter((photo) => photo.id !== photoId)
-    const limit = pagination.value.limit || photosPerPage
-    const totalPhotos = Math.max(0, (pagination.value.total_photos || 0) - 1)
-    const totalPages = Math.max(1, Math.ceil(totalPhotos / limit))
-    if (currentPage.value > totalPages) currentPage.value = totalPages
-    pagination.value = {
-      ...pagination.value,
-      total_photos: totalPhotos,
-      total_pages: totalPages,
-      has_prev: currentPage.value > 1,
-      has_next: currentPage.value < totalPages,
-    }
-    updatePageUrl()
-  }
   selectedPhoto.value = null
+  void gallery.removePhoto(photoId)
   notify('Photo deleted', 'success')
-  void loadPhotos(currentPage.value)
 }
 
 function changePage(page) {
-  const target = Math.min(Math.max(Number(page) || 1, 1), pagination.value.total_pages || 1)
-  if (target === currentPage.value) return
   notifyUserActivity()
-  loadPhotos(target)
+  return gallery.changePage(page)
 }
 
 function changeView(nextView) {
   const nextCarouselOnly = nextView === 'carousel'
   if (nextCarouselOnly === carouselOnly.value) return
-  carouselOnly.value = nextCarouselOnly
-  currentPage.value = 1
+  gallery.setCarouselView(nextCarouselOnly)
   notifyUserActivity()
-  loadPhotos(1)
 }
 
 async function handleCarouselUpdated({ id, included }) {
-  photos.value = photos.value.map((photo) => (
-    photo.id === id ? { ...photo, carousel_enabled: included } : photo
-  ))
+  gallery.patchPhoto({ id, carousel_enabled: included })
   if (selectedPhoto.value?.id === id) {
     selectedPhoto.value = { ...selectedPhoto.value, carousel_enabled: included }
   }
   await loadCarouselStatus()
-  await loadPhotos(currentPage.value)
+  await gallery.invalidate()
 }
 
 async function handleDisplayControl(action) {
@@ -429,14 +363,14 @@ watch(() => downloadJob.state.value.status, (status) => {
 watch(() => deleteJob.state.value.status, async (status) => {
   if (status === 'completed') {
     notify(deleteJob.state.value.message || 'All photos deleted', 'success')
-    await loadPhotos(1)
+    await gallery.invalidate()
     setTimeout(() => deleteJob.reset(), 2500)
   }
 })
 
 onMounted(async () => {
   window.addEventListener('pagehide', handlePageHide)
-  await Promise.all([loadPhotos(currentPage.value), loadInitialSettings(), loadCarouselStatus()])
+  await Promise.all([loadExtensionActions(), loadInitialSettings(), loadCarouselStatus()])
   const downloadProgress = await downloadJob.syncJob()
   if (['preparing', 'creating', 'running', 'aborting'].includes(downloadProgress?.status)) {
     notify('A photo download is already running. Its progress has been restored.', 'info')
@@ -474,11 +408,11 @@ onUnmounted(() => {
   <main class="app-shell">
     <AppHeader
       :battery-level="batteryLevel"
-      :photo-count="pagination.total_photos"
+      :photo-count="gallery.pagination.total_photos"
       :capture-busy="captureBusy"
       :carousel-active="carouselActive"
       :carousel-busy="carouselBusy"
-      @refresh="loadPhotos(currentPage)"
+      @refresh="gallery.refresh"
       @capture="handleCapture"
       @live-preview="openLivePreview"
       @toggle-carousel="handleCarouselToggle"
@@ -489,17 +423,27 @@ onUnmounted(() => {
       <button class="tab-button" :class="{ active: carouselOnly }" type="button" @click="changeView('carousel')">carousel</button>
     </nav>
     <PhotoGallery
-      :photos="photos"
-      :pagination="pagination"
-      :current-page="currentPage"
-      :loading="galleryLoading"
-      :error="galleryError"
+      :photos="gallery.photos"
+      :pages="gallery.pages"
+      :pagination="gallery.pagination"
+      :current-page="gallery.currentPage"
+      :page-size="gallery.pageSize"
+      :page-size-options="gallery.pageSizeOptions"
+      :set-sentinel="gallery.setSentinel"
+      :loading="gallery.isPending"
+      :fetching="gallery.isFetching"
+      :fetching-next-page="gallery.isFetchingNextPage"
+      :page-jump-busy="gallery.pageJumpBusy"
+      :error="gallery.error"
+      :sentinel="gallery.sentinel"
       :extension-actions="extensionActions"
       :busy-action="busyAction"
       @select="selectPhoto"
       @display="handleDisplay"
       @extension="handleExtension"
       @change-page="changePage"
+      @change-page-size="gallery.setPageSize"
+      @retry="gallery.retry"
     />
     <PhotoPreviewDialog
       :photo="selectedPhoto"

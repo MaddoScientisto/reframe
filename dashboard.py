@@ -22,6 +22,7 @@ import httpx
 from PIL import Image
 
 from dashboard_presenter import register_dashboard_ui
+from photo_contract import dithered_download_filename
 
 CAMERA_AVAILABLE = False
 
@@ -40,11 +41,16 @@ os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
 app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
 
 
-def prepare_dithered_export(image_path: str, upscale_2x: bool) -> tuple[bytes, str, str]:
+def prepare_dithered_export(
+    image_path: str,
+    upscale_2x: bool,
+    download_filename: str | None = None,
+) -> tuple[bytes, str, str]:
     """Read a dithered image, optionally returning a lossless 2x PNG export."""
     source_path = Path(image_path)
+    export_filename = download_filename or source_path.name
     if not upscale_2x:
-        return source_path.read_bytes(), source_path.name, "image/png"
+        return source_path.read_bytes(), export_filename, "image/png"
 
     with Image.open(source_path) as image:
         resampling = getattr(Image, "Resampling", Image)
@@ -55,7 +61,7 @@ def prepare_dithered_export(image_path: str, upscale_2x: bool) -> tuple[bytes, s
         output = BytesIO()
         enlarged.save(output, format="PNG")
 
-    return output.getvalue(), f"{source_path.stem}.png", "image/png"
+    return output.getvalue(), export_filename, "image/png"
 
 
 class SettingsValidationError(ValueError):
@@ -905,9 +911,17 @@ async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = Fals
         page = 1
     if limit < 1 or limit > 100:
         limit = 20
+    hardware_pagination = None
     try:
-        # Fetch all photos from hardware service and paginate here for simplicity
-        all_photos = await reframe_client.get("/photos")
+        hardware_page = await reframe_client.get(
+            f"/photos?page={page}&limit={limit}&carousel_only={'true' if carousel_only else 'false'}"
+        )
+        if isinstance(hardware_page, dict) and isinstance(hardware_page.get("photos"), list):
+            all_photos = hardware_page["photos"]
+            hardware_pagination = hardware_page.get("pagination", {})
+        else:
+            # Keep compatibility with an older camera service until reboot.
+            all_photos = hardware_page if isinstance(hardware_page, list) else []
         # Rewrite absolute file system paths to dashboard-served URLs
         for photo in all_photos:
             try:
@@ -927,23 +941,35 @@ async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = Fals
     carousel_ids = set(settings_manager.load_settings().get("carousel", {}).get("photo_ids", []))
     for photo in all_photos:
         photo["carousel_enabled"] = photo.get("id") in carousel_ids
-    if carousel_only:
+    if carousel_only and hardware_pagination is None:
         all_photos = [photo for photo in all_photos if photo["carousel_enabled"]]
 
-    start = (page - 1) * limit
-    end = start + limit
-    total = len(all_photos)
-    total_pages = (total + limit - 1) // limit if total else 1
-    return {
-        "photos": all_photos[start:end],
-        "pagination": {
+    if hardware_pagination is not None:
+        pagination = {
+            "page": int(hardware_pagination.get("page", page)),
+            "limit": int(hardware_pagination.get("limit", limit)),
+            "total_photos": int(hardware_pagination.get("total_photos", len(all_photos))),
+            "total_pages": int(hardware_pagination.get("total_pages", 1)),
+            "has_prev": bool(hardware_pagination.get("has_prev", page > 1)),
+            "has_next": bool(hardware_pagination.get("has_next", False)),
+        }
+    else:
+        start = (page - 1) * limit
+        end = start + limit
+        total = len(all_photos)
+        total_pages = (total + limit - 1) // limit if total else 1
+        all_photos = all_photos[start:end]
+        pagination = {
             "page": page,
             "limit": limit,
             "total_photos": total,
             "total_pages": total_pages,
             "has_prev": page > 1,
             "has_next": page < total_pages,
-        },
+        }
+    return {
+        "photos": all_photos,
+        "pagination": pagination,
     }
 
 @app.get("/api/photos/{photo_id}")
@@ -1027,14 +1053,32 @@ async def download_dithered_photo(filename: str):
 
     settings = settings_manager.load_settings()
     upscale_2x = bool(settings.get("exports", {}).get("upscale_dithered_2x", False))
+    original_filename = filename
+    dithering_method = "unknown"
+    try:
+        photos = await reframe_client.get("/photos")
+        for photo in photos if isinstance(photos, list) else []:
+            if os.path.basename(photo.get("dithered_path", "")) != filename:
+                continue
+            original_filename = os.path.basename(photo.get("filename") or filename)
+            dithering_method = photo.get("dithering_method") or "unknown"
+            break
+    except Exception:
+        pass
+    download_filename = dithered_download_filename(
+        original_filename,
+        dithering_method,
+        upscale_2x=upscale_2x,
+    )
     if not upscale_2x:
-        return FileResponse(file_path, filename=filename)
+        return FileResponse(file_path, filename=download_filename)
 
     try:
         content, export_filename, media_type = await asyncio.to_thread(
             prepare_dithered_export,
             file_path,
-            True
+            True,
+            download_filename,
         )
     except OSError as error:
         raise HTTPException(status_code=500, detail=f"Could not prepare dithered download: {error}") from error
