@@ -24,3 +24,12 @@ export function markImagePreviewLoaded(source) {
 export function forgetImagePreview(source) {
   if (source) loadedImageSources.delete(source)
 }
+
+export function invalidateImagePreview(source) {
+  if (!source) return
+  for (const loadedSource of loadedImageSources) {
+    if (loadedSource === source || loadedSource.startsWith(`${source}?`)) {
+      loadedImageSources.delete(loadedSource)
+    }
+  }
+}

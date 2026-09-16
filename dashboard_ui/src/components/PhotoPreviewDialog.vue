@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { downloadBlob, downloadUrl } from '../api/fileDownload'
 import {
   deletePhoto,
   displayPhoto,
@@ -46,7 +47,8 @@ const ditherControlsOpen = ref(false)
 const extensionBusy = ref('')
 const carouselIncluded = ref(false)
 const carouselSaving = ref(false)
-const metadataOpen = ref(true)
+const metadataOpen = ref(typeof window === 'undefined' || !window.matchMedia('(max-width: 700px)').matches)
+const downloading = ref('')
 const revision = ref(0)
 const savedRevision = ref('')
 const stageRef = ref(null)
@@ -165,12 +167,8 @@ const visualDimensions = computed(() => {
     : renderedDimensions.value
 })
 
-const sourceExifRotation = computed(() => (
-  tab.value === 'dithered' && !isGenerated.value ? initialRotation.value : 0
-))
-
 const previewRotation = computed(() => (
-  (rotation.value - sourceExifRotation.value + 4) % 4
+  ((rotation.value % 4) + 4) % 4
 ))
 
 const stageStyle = computed(() => {
@@ -242,11 +240,13 @@ function resetPreviewState(photo) {
   downloadPng.value = ''
   loading.value = false
   sending.value = false
+  downloading.value = ''
   error.value = ''
   rotation.value = initialRotation.value
   imageDimensions.value = null
   resetViewport()
   ditherControlsOpen.value = false
+  metadataOpen.value = typeof window === 'undefined' || !window.matchMedia('(max-width: 700px)').matches
   extensionBusy.value = ''
   carouselIncluded.value = Boolean(photo.carousel_enabled)
   carouselSaving.value = false
@@ -479,26 +479,23 @@ async function rotateBlob(blob) {
 async function downloadImage(kind, event) {
   event.preventDefault()
   const href = kind === 'original' ? props.photo?.original_path : ditheredDownload.value
-  if (!href || (kind === 'dithered' && loading.value)) return
+  if (!href || (kind === 'dithered' && loading.value) || downloading.value) return
   const filename = kind === 'original' ? props.photo.filename : ditheredFilename.value
+  downloading.value = kind
+  error.value = ''
   try {
     if (!rotation.value) {
-      const link = document.createElement('a')
-      link.href = href
-      link.download = filename
-      link.click()
+      await downloadUrl(href, filename)
       return
     }
     const response = await fetch(href)
     if (!response.ok) throw new Error('Could not download image')
     const rotated = await rotateBlob(await response.blob())
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(rotated)
-    link.download = filename
-    link.click()
-    setTimeout(() => URL.revokeObjectURL(link.href), 60000)
+    downloadBlob(rotated, filename)
   } catch (downloadError) {
     error.value = downloadError.message
+  } finally {
+    downloading.value = ''
   }
 }
 
@@ -738,6 +735,49 @@ onUnmounted(() => {
               </label>
             </div>
           </details>
+          <p class="dialog-status" role="status" aria-live="polite">{{ error }}</p>
+          <div class="dialog-actions preview-dialog-actions">
+            <button
+              class="action-button primary"
+              type="button"
+              :disabled="!photo || Boolean(downloading)"
+              :aria-busy="downloading === 'original'"
+              @click="downloadImage('original', $event)"
+            >
+              <span v-if="downloading === 'original'" class="button-spinner" aria-hidden="true"></span>
+              {{ downloading === 'original' ? 'downloading...' : 'original download' }}
+            </button>
+            <button
+              class="action-button secondary"
+              type="button"
+              :disabled="!ditheredDownload || loading || Boolean(downloading)"
+              :aria-busy="downloading === 'dithered'"
+              @click="downloadImage('dithered', $event)"
+            >
+              <span v-if="downloading === 'dithered'" class="button-spinner" aria-hidden="true"></span>
+              {{ downloading === 'dithered' ? 'downloading...' : 'dithered download' }}
+            </button>
+            <button class="action-button success" type="button" :disabled="loading || sending" @click="sendToDisplay">
+              {{ sending ? 'sending...' : 'display' }}
+            </button>
+            <button class="action-button primary" type="button" :disabled="!hasChanges || loading || saving" @click="savePreview">
+              {{ saving ? 'saving...' : 'save' }}
+            </button>
+            <button
+              v-for="action in extensionActions.filter((item) => !item.requires_dithered || photo?.has_dithered)"
+              v-show="!isGenerated && photo?.has_dithered"
+              :key="action.id"
+              class="action-button secondary"
+              type="button"
+              :disabled="extensionBusy === action.id"
+              @click="runExtension(action)"
+            >
+              {{ extensionBusy === action.id ? 'working...' : action.action_label }}
+            </button>
+            <button class="action-button danger preview-delete-button" type="button" :disabled="deleting" @click="openDeleteConfirmation">
+              delete
+            </button>
+          </div>
         </div>
         <details class="photo-metadata" :open="metadataOpen" @toggle="metadataOpen = $event.currentTarget.open">
           <summary>photo information</summary>
@@ -752,45 +792,6 @@ onUnmounted(() => {
           </dl>
         </details>
       </div>
-    </div>
-    <p class="dialog-status" role="status" aria-live="polite">{{ error }}</p>
-    <div class="dialog-actions">
-      <button
-        class="action-button primary"
-        type="button"
-        :disabled="!photo"
-        @click="downloadImage('original', $event)"
-      >
-        original download
-      </button>
-      <button
-        class="action-button secondary"
-        type="button"
-        :disabled="!ditheredDownload || loading"
-        @click="downloadImage('dithered', $event)"
-      >
-        dithered download
-      </button>
-      <button class="action-button success" type="button" :disabled="loading || sending" @click="sendToDisplay">
-        {{ sending ? 'sending...' : 'display' }}
-      </button>
-      <button class="action-button primary" type="button" :disabled="!hasChanges || loading || saving" @click="savePreview">
-        {{ saving ? 'saving...' : 'save' }}
-      </button>
-      <button
-        v-for="action in extensionActions.filter((item) => !item.requires_dithered || photo?.has_dithered)"
-        v-show="!isGenerated && photo?.has_dithered"
-        :key="action.id"
-        class="action-button secondary"
-        type="button"
-        :disabled="extensionBusy === action.id"
-        @click="runExtension(action)"
-      >
-        {{ extensionBusy === action.id ? 'working...' : action.action_label }}
-      </button>
-      <button class="action-button danger preview-delete-button" type="button" :disabled="deleting" @click="openDeleteConfirmation">
-        delete
-      </button>
     </div>
   </dialog>
   <dialog ref="deleteDialogRef" class="confirmation-dialog" aria-labelledby="delete-photo-title">

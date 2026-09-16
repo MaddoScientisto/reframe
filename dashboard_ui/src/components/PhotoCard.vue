@@ -1,5 +1,6 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { downloadUrl } from '../api/fileDownload'
 import { ditheredDownloadUrl } from '../api/dashboardApi'
 import { forgetImagePreview, isImagePreviewLoaded, markImagePreviewLoaded } from '../composables/photoPreviewCache'
 
@@ -9,14 +10,22 @@ const props = defineProps({
   busyAction: { type: String, default: '' },
 })
 
-defineEmits(['select', 'display', 'extension'])
-
 const imageLoading = ref(true)
 const imageError = ref(false)
 const imageKey = ref(0)
+const menuOpen = ref(false)
+const menuRef = ref(null)
+const downloading = ref('')
+const downloadError = ref('')
+
+const emit = defineEmits(['select', 'display', 'extension', 'context-action'])
 
 function actionKey(action) {
   return `${action.id}:${props.photo.id}`
+}
+
+function busyKey(action) {
+  return `${action}:${props.photo.id}`
 }
 
 function imageSource(photo) {
@@ -44,11 +53,55 @@ function retryImage() {
   imageKey.value += 1
 }
 
+function toggleMenu() {
+  if (downloading.value) return
+  menuOpen.value = !menuOpen.value
+}
+
+function closeMenu() {
+  menuOpen.value = false
+}
+
+async function downloadPhoto(kind) {
+  if (downloading.value) return
+  const href = kind === 'original' ? props.photo.original_path : ditheredDownloadUrl(props.photo)
+  if (!href || (kind === 'dithered' && !props.photo.has_dithered)) return
+  const filename = kind === 'original'
+    ? props.photo.filename || `${props.photo.id}.jpg`
+    : `${props.photo.id}_dithered.png`
+  downloading.value = kind
+  downloadError.value = ''
+  closeMenu()
+  try {
+    await downloadUrl(href, filename)
+  } catch (error) {
+    downloadError.value = error.message || 'Could not download photo'
+  } finally {
+    downloading.value = ''
+  }
+}
+
+function handleMenuAction(action) {
+  if (action === 'download-original' || action === 'download-dithered') {
+    void downloadPhoto(action === 'download-original' ? 'original' : 'dithered')
+    return
+  }
+  closeMenu()
+  emit('context-action', { action, photo: props.photo })
+}
+
+function handleDocumentPointerDown(event) {
+  if (!menuRef.value?.contains(event.target)) closeMenu()
+}
+
 watch(() => imageSource(props.photo), (source) => {
   imageLoading.value = Boolean(source) && !isImagePreviewLoaded(source)
   imageError.value = !source
   imageKey.value += 1
 }, { immediate: true })
+
+onMounted(() => document.addEventListener('pointerdown', handleDocumentPointerDown))
+onUnmounted(() => document.removeEventListener('pointerdown', handleDocumentPointerDown))
 </script>
 
 <template>
@@ -74,9 +127,11 @@ watch(() => imageSource(props.photo), (source) => {
         v-if="!imageError && imageSource(photo)"
         :key="imageKey"
         class="photo-image"
+        :class="{ dithered: Boolean(photo.dithered_path) }"
         draggable="false"
         :src="imageSource(photo)"
         :alt="`Photo ${photo.id}`"
+        :style="{ '--photo-rotation': `${Number(photo.rotation || 0) * 90}deg` }"
         :loading="isImagePreviewLoaded(imageSource(photo)) ? 'eager' : 'lazy'"
         @load="handleImageLoad"
         @error="handleImageError"
@@ -85,15 +140,27 @@ watch(() => imageSource(props.photo), (source) => {
     <div class="photo-info">
       <p class="photo-name">{{ photo.filename || photo.id }}</p>
       <div class="photo-actions" @click.stop>
-        <a class="action-button primary" :href="photo.original_path" download>original</a>
-        <a
+        <button
+          class="action-button primary"
+          type="button"
+          :disabled="Boolean(downloading)"
+          :aria-busy="downloading === 'original'"
+          @click="downloadPhoto('original')"
+        >
+          <span v-if="downloading === 'original'" class="button-spinner" aria-hidden="true"></span>
+          {{ downloading === 'original' ? 'downloading...' : 'original' }}
+        </button>
+        <button
           v-if="photo.has_dithered"
           class="action-button secondary"
-          :href="ditheredDownloadUrl(photo)"
-          download
+          type="button"
+          :disabled="Boolean(downloading)"
+          :aria-busy="downloading === 'dithered'"
+          @click="downloadPhoto('dithered')"
         >
-          dithered
-        </a>
+          <span v-if="downloading === 'dithered'" class="button-spinner" aria-hidden="true"></span>
+          {{ downloading === 'dithered' ? 'downloading...' : 'dithered' }}
+        </button>
         <button class="action-button success" type="button" :disabled="busyAction === `display:${photo.id}`" @click="$emit('display', photo)">
           {{ busyAction === `display:${photo.id}` ? 'sending...' : 'display' }}
         </button>
@@ -107,7 +174,33 @@ watch(() => imageSource(props.photo), (source) => {
         >
           {{ busyAction === actionKey(action) ? 'working...' : action.action_label }}
         </button>
+        <div ref="menuRef" class="photo-action-menu">
+          <button
+            class="icon-button photo-menu-button"
+            type="button"
+            aria-label="More photo options"
+            aria-haspopup="menu"
+            :aria-expanded="menuOpen"
+            :disabled="Boolean(downloading)"
+            @click="toggleMenu"
+          >
+            ...
+          </button>
+          <div v-if="menuOpen" class="photo-context-menu" role="menu">
+            <button class="photo-context-item" type="button" role="menuitem" @click="handleMenuAction('preview')">preview</button>
+            <button class="photo-context-item" type="button" role="menuitem" :disabled="Boolean(downloading)" @click="handleMenuAction('download-original')">download original</button>
+            <button v-if="photo.has_dithered" class="photo-context-item" type="button" role="menuitem" :disabled="Boolean(downloading)" @click="handleMenuAction('download-dithered')">download dithered</button>
+            <button class="photo-context-item" type="button" role="menuitem" :disabled="busyAction === busyKey('display')" @click="handleMenuAction('display')">display</button>
+            <button class="photo-context-item" type="button" role="menuitem" :disabled="busyAction === busyKey('carousel')" @click="handleMenuAction(photo.carousel_enabled ? 'remove-carousel' : 'add-carousel')">
+              {{ photo.carousel_enabled ? 'remove from carousel' : 'add to carousel' }}
+            </button>
+            <button v-if="photo.has_dithered" class="photo-context-item" type="button" role="menuitem" :disabled="busyAction === busyKey('rotate-left')" @click="handleMenuAction('rotate-left')">rotate left</button>
+            <button v-if="photo.has_dithered" class="photo-context-item" type="button" role="menuitem" :disabled="busyAction === busyKey('rotate-right')" @click="handleMenuAction('rotate-right')">rotate right</button>
+            <button class="photo-context-item danger" type="button" role="menuitem" :disabled="busyAction === busyKey('delete')" @click="handleMenuAction('delete')">delete</button>
+          </div>
+        </div>
       </div>
+      <p v-if="downloadError" class="photo-download-error" role="status">{{ downloadError }}</p>
     </div>
   </article>
 </template>

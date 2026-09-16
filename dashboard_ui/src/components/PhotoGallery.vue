@@ -19,7 +19,7 @@ defineProps({
   setSentinel: { type: Function, required: true },
 })
 
-defineEmits(['select', 'display', 'extension', 'change-page', 'change-page-size', 'retry'])
+defineEmits(['select', 'display', 'extension', 'context-action', 'change-page', 'change-page-size', 'retry'])
 </script>
 
 <template>
@@ -70,6 +70,7 @@ defineEmits(['select', 'display', 'extension', 'change-page', 'change-page-size'
             @select="$emit('select', $event)"
             @display="$emit('display', $event)"
             @extension="(action, photo) => $emit('extension', action, photo)"
+            @context-action="$emit('context-action', $event)"
           />
         </div>
       </section>

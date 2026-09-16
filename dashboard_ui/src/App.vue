@@ -6,12 +6,14 @@ import PhotoGallery from './components/PhotoGallery.vue'
 import PhotoPreviewDialog from './components/PhotoPreviewDialog.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import { useLongRunningJob } from './composables/useLongRunningJob'
+import { invalidateImagePreview } from './composables/photoPreviewCache'
 import { usePhotoGallery } from './composables/usePhotoGallery'
 import {
   abortDelete,
   abortDownload,
   capturePhoto,
   checkForUpdates,
+  deletePhoto,
   displayControl,
   displayPhoto,
   getBattery,
@@ -24,6 +26,8 @@ import {
   resetTimeout,
   runExtensionAction,
   saveSettings,
+  savePhotoPreview,
+  setCarouselPhoto,
   showDashboardQr,
   startCarousel,
   startDelete,
@@ -216,6 +220,82 @@ async function handleExtension(action, photo) {
     notify(result.message || 'Action complete', 'success')
   } catch (error) {
     notify(error.message || 'Extension action failed', 'error')
+  } finally {
+    busyAction.value = ''
+  }
+}
+
+function nextPhotoRotation(photo, direction) {
+  const current = Number.isInteger(photo.rotation) ? photo.rotation : 0
+  return (current + direction + 4) % 4
+}
+
+async function handleGalleryContextAction({ action, photo }) {
+  if (action === 'preview') {
+    selectPhoto(photo)
+    return
+  }
+  if (action === 'display') {
+    await handleDisplay(photo)
+    return
+  }
+
+  const actionKey = action === 'add-carousel' || action === 'remove-carousel'
+    ? `carousel:${photo.id}`
+    : `${action}:${photo.id}`
+  if (busyAction.value === actionKey) return
+
+  if (action === 'delete' && !window.confirm('Delete this photo and its dithered image?')) return
+
+  busyAction.value = actionKey
+  await notifyUserActivity()
+  try {
+    if (action === 'delete') {
+      await deletePhoto(photo.id)
+      await gallery.removePhoto(photo.id)
+      notify('Photo deleted', 'success')
+      return
+    }
+
+    if (action === 'add-carousel' || action === 'remove-carousel') {
+      const result = await setCarouselPhoto(photo.id, action === 'add-carousel')
+      const included = Boolean(result.included)
+      gallery.patchPhoto({ id: photo.id, carousel_enabled: included })
+      await loadCarouselStatus()
+      notify(included ? 'Photo added to carousel' : 'Photo removed from carousel', 'success')
+      return
+    }
+
+    const direction = action === 'rotate-right' ? 1 : -1
+    const nextRotation = nextPhotoRotation(photo, direction)
+    const result = await savePhotoPreview(photo.id, {
+      png: null,
+      rotation: nextRotation,
+      dithering_method: photo.dithering_method || 'floyd_steinberg',
+      gb_color_palette: photo.gb_color_palette || 'blue_yellow',
+    })
+    const savedPhoto = {
+      ...photo,
+      ...(result.photo || {}),
+      rotation: result.rotation ?? nextRotation,
+    }
+    invalidateImagePreview(photo.dithered_path)
+    gallery.patchPhoto(savedPhoto)
+    if (selectedPhoto.value?.id === photo.id) {
+      selectedPhoto.value = { ...selectedPhoto.value, ...savedPhoto }
+    }
+    await gallery.invalidate()
+    const refreshedPhoto = gallery.photos.find((item) => item.id === photo.id)
+    if (refreshedPhoto) {
+      invalidateImagePreview(refreshedPhoto.dithered_path)
+      gallery.patchPhoto(refreshedPhoto)
+      if (selectedPhoto.value?.id === photo.id) {
+        selectedPhoto.value = { ...selectedPhoto.value, ...refreshedPhoto }
+      }
+    }
+    notify(direction > 0 ? 'Photo rotated right' : 'Photo rotated left', 'success')
+  } catch (error) {
+    notify(error.message || 'Could not update photo', 'error')
   } finally {
     busyAction.value = ''
   }
@@ -441,6 +521,7 @@ onUnmounted(() => {
       @select="selectPhoto"
       @display="handleDisplay"
       @extension="handleExtension"
+      @context-action="handleGalleryContextAction"
       @change-page="changePage"
       @change-page-size="gallery.setPageSize"
       @retry="gallery.retry"
