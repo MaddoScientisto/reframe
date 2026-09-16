@@ -48,6 +48,10 @@ defineEmits(['select', 'display', 'extension', 'change-page', 'change-page-size'
     </div>
     <div v-else-if="!photos.length" class="gallery-message">no photos found. capture your first photo!</div>
     <div v-else class="gallery-pages">
+      <div v-if="error && photos.length" class="gallery-service-error" role="alert">
+        <p>{{ error }}</p>
+        <button class="pagination-button" type="button" @click="$emit('retry')">retry connection</button>
+      </div>
       <div v-if="fetching" class="gallery-fetching" role="status">refreshing gallery...</div>
       <section
         v-for="page in pages"
@@ -72,10 +76,8 @@ defineEmits(['select', 'display', 'extension', 'change-page', 'change-page-size'
       <div :ref="setSentinel" class="gallery-sentinel" aria-live="polite">
         <span v-if="fetchingNextPage" class="loading-spinner" aria-label="Loading more photos"></span>
         <span v-if="fetchingNextPage">loading more photos...</span>
-        <button v-if="error && !fetchingNextPage" class="pagination-button" type="button" @click="$emit('retry')">retry loading photos</button>
       </div>
     </div>
-    <p v-if="error && photos.length" class="inline-error">{{ error }}</p>
     <Pagination
       placement="bottom"
       :pagination="pagination"

@@ -922,6 +922,7 @@ async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = Fals
     if limit < 1 or limit > 100:
         limit = 20
     hardware_pagination = None
+    service_error = None
     try:
         hardware_page = await reframe_client.get(
             f"/photos?page={page}&limit={limit}&carousel_only={'true' if carousel_only else 'false'}"
@@ -947,7 +948,15 @@ async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = Fals
                 continue
     except Exception as e:
         logging.warning(f"Error fetching photos from hardware service: {e}")
-        all_photos = []
+        service_error = (
+            "Camera service unavailable. Showing saved photos; capture and live preview may be unavailable."
+        )
+        try:
+            local_page = photo_manager.get_all_photos(page=1, limit=100000)
+            all_photos = local_page.get("photos", []) if isinstance(local_page, dict) else []
+        except Exception as local_error:
+            logging.warning(f"Error reading saved photos for hardware fallback: {local_error}")
+            all_photos = []
     carousel_ids = set(settings_manager.load_settings().get("carousel", {}).get("photo_ids", []))
     for photo in all_photos:
         photo["carousel_enabled"] = photo.get("id") in carousel_ids
@@ -980,6 +989,7 @@ async def list_photos(page: int = 1, limit: int = 20, carousel_only: bool = Fals
     return {
         "photos": all_photos,
         "pagination": pagination,
+        "service_error": service_error,
     }
 
 @app.get("/api/photos/{photo_id}")

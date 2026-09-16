@@ -21,6 +21,17 @@ test('normalized pages preserve server page and slot identity', () => {
   assert.equal(page.photos[0].slotKey, 'view:all:limit:12:page:3:slot:0')
 })
 
+test('normalized pages preserve saved photos with non-fatal service errors', () => {
+  const page = normalizePage({
+    service_error: 'Camera service unavailable. Showing saved photos.',
+    photos: [{ id: '16b9cc47', filename: 'photo.jpg' }],
+    pagination: { page: 1, limit: 12, total_photos: 1, total_pages: 1 },
+  }, 1, 'view:all:limit:12')
+
+  assert.equal(page.serviceError, 'Camera service unavailable. Showing saved photos.')
+  assert.equal(page.photos.length, 1)
+})
+
 test('records without stable ids are rejected', () => {
   assert.throws(() => normalizePage({ photos: [{ filename: 'missing-id.jpg' }] }, 1, 'view:all:limit:12'), /without an id/)
 })

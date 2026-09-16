@@ -13,9 +13,13 @@ export function normalizePage(response, pageParam, viewKey) {
   const serverPagination = response?.pagination || {}
   const serverPage = readNumber(serverPagination.page) || pageParam
   const photos = Array.isArray(response?.photos) ? response.photos : []
+  const serviceError = typeof response?.service_error === 'string'
+    ? response.service_error.trim()
+    : ''
   return {
     page: serverPage,
     pageKey: `${viewKey}:page:${serverPage}`,
+    serviceError,
     pagination: {
       page: serverPage,
       limit: readNumber(serverPagination.limit) || readNumber(serverPagination.photos_per_page) || 12,

@@ -217,6 +217,23 @@ p {
   font-size: 0.85rem;
 }
 
+.gallery-service-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--danger);
+  background: #f8e9e6;
+  color: var(--danger);
+}
+
+.gallery-service-error p {
+  margin: 0;
+}
+
 .photo-card {
   min-width: 0;
   border: 1px solid var(--soft-line);

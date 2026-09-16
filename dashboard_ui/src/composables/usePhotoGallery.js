@@ -74,9 +74,10 @@ export function usePhotoGallery(carouselOnly) {
           seen.add(photo.entityKey)
         }
       }
-      return { pages: normalized, error: null }
+      const serviceError = normalized.find((page) => page.serviceError)?.serviceError || ''
+      return { pages: normalized, error: null, serviceError }
     } catch (error) {
-      return { pages: [], error }
+      return { pages: [], error, serviceError: '' }
     }
   })
 
@@ -104,7 +105,12 @@ export function usePhotoGallery(carouselOnly) {
     has_prev: false,
     has_next: false,
   })
-  const error = computed(() => normalizedGallery.value.error?.message || query.error.value?.message || '')
+  const error = computed(() => (
+    normalizedGallery.value.error?.message
+    || query.error.value?.message
+    || normalizedGallery.value.serviceError
+    || ''
+  ))
 
   function updatePageUrl() {
     const url = new URL(window.location.href)

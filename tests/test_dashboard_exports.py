@@ -181,6 +181,33 @@ class DitheredExportTests(unittest.TestCase):
                 {f"original/{self.image_path.name}", f"dithered/{self.image_path.name}"},
             )
 
+    def test_photo_list_falls_back_to_saved_photos_with_service_error(self):
+        async def unavailable(_path):
+            raise OSError("hardware API unavailable")
+
+        saved_photos = [
+            {"id": "newest", "filename": "newest.jpg", "original_path": "/photos/newest.jpg"},
+            {"id": "older", "filename": "older.jpg", "original_path": "/photos/older.jpg"},
+        ]
+
+        with patch.object(dashboard.reframe_client, "get", new=unavailable), patch.object(
+            dashboard.photo_manager,
+            "get_all_photos",
+            return_value={"photos": saved_photos},
+        ), patch.object(
+            dashboard.settings_manager,
+            "load_settings",
+            return_value={"carousel": {"photo_ids": []}},
+        ):
+            result = asyncio.run(dashboard.list_photos(page=1, limit=1))
+
+        self.assertEqual(result["photos"], [
+            {**saved_photos[0], "carousel_enabled": False},
+        ])
+        self.assertIn("Camera service unavailable", result["service_error"])
+        self.assertEqual(result["pagination"]["total_photos"], 2)
+        self.assertTrue(result["pagination"]["has_next"])
+
     def test_abort_active_download_reports_stopping_state(self):
         progress = {
             "status": "creating",
