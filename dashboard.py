@@ -11,6 +11,7 @@ import math
 import tempfile
 import threading
 import base64
+import subprocess
 from io import BytesIO
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,71 @@ os.makedirs(PHOTOS_PATH, exist_ok=True)
 os.makedirs(DITHERED_PHOTOS_PATH, exist_ok=True)
 
 app = FastAPI(title="Reframe Dashboard", description="Control & Gallery Interface for Reframe Camera")
+
+
+def get_local_network_status() -> Dict[str, Optional[str]]:
+    """Return the connected Wi-Fi name and IPv4 address when available."""
+    status: Dict[str, Optional[str]] = {"ssid": None, "ip_address": None}
+
+    try:
+        ip_result = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", "dev", "wlan0", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if ip_result.returncode == 0:
+            fields = ip_result.stdout.split()
+            for index, field in enumerate(fields[:-1]):
+                if field == "inet":
+                    status["ip_address"] = fields[index + 1].split("/", 1)[0]
+                    break
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    for command in (
+        ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+        ["iwgetid", "-r", "wlan0"],
+        ["iw", "dev", "wlan0", "link"],
+    ):
+        try:
+            wifi_result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if wifi_result.returncode != 0:
+            continue
+        if command[0] == "nmcli":
+            ssid = next(
+                (
+                    line.partition(":")[2].replace("\\:", ":")
+                    for line in wifi_result.stdout.splitlines()
+                    if line.startswith("yes:")
+                ),
+                "",
+            )
+        elif command[0] == "iwgetid":
+            ssid = wifi_result.stdout.strip()
+        else:
+            ssid = next(
+                (
+                    line.partition("SSID:")[2].strip()
+                    for line in wifi_result.stdout.splitlines()
+                    if "SSID:" in line
+                ),
+                "",
+            )
+        if ssid:
+            status["ssid"] = ssid
+            break
+
+    return status
 
 
 def prepare_dithered_export(
@@ -1634,6 +1700,12 @@ async def get_system_status():
         return status
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Hardware service unavailable: {str(e)}")
+
+
+@app.get("/api/network")
+async def get_network_status():
+    """Return optional local Wi-Fi connection details for the dashboard header."""
+    return get_local_network_status()
 
 # ═══════════════════════════════════════════════════════════════════
 # HARDWARE: Battery — PiSugar 3 via pisugar-server TCP

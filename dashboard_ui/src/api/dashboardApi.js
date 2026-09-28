@@ -96,6 +96,10 @@ export function getBattery() {
   return request('/api/battery')
 }
 
+export function getNetworkStatus() {
+  return request('/api/network')
+}
+
 export function resetTimeout() {
   return request('/api/timeout/reset', { method: 'POST' })
 }

@@ -1,6 +1,7 @@
 <script setup>
 defineProps({
   batteryLevel: { type: Number, default: null },
+  networkStatus: { type: Object, default: () => ({}) },
   photoCount: { type: Number, default: 0 },
   captureBusy: { type: Boolean, default: false },
   carouselActive: { type: Boolean, default: false },
@@ -18,8 +19,16 @@ defineEmits(['refresh', 'capture', 'live-preview', 'settings', 'toggle-carousel'
     </div>
     <div class="header-actions">
       <div class="status-strip" aria-live="polite">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span>system online</span>
+        <div class="system-status">
+          <div class="system-online">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>system online</span>
+          </div>
+          <div v-if="networkStatus.ssid || networkStatus.ip_address" class="network-status">
+            <span v-if="networkStatus.ssid">Wi-Fi: {{ networkStatus.ssid }}</span>
+            <span v-if="networkStatus.ip_address">IP: {{ networkStatus.ip_address }}</span>
+          </div>
+        </div>
         <span> battery: {{ batteryLevel === null ? '--%' : `${batteryLevel}%` }}</span>
         <span>{{ photoCount }} photos</span>
       </div>
