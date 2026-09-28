@@ -101,7 +101,11 @@ class EPD:
         epdconfig.delay_ms(200)
         logger.debug("e-Paper busy H release")
 
-    def TurnOnDisplay(self, abort_event=None):
+    def TurnOnDisplay(self, abort_event=None, fast_refresh=False):
+        self._raise_if_aborted(abort_event)
+        self.send_command(0x30) # PLL CONTROL
+        self.send_data(0x07 if fast_refresh else 0x08)
+
         self._raise_if_aborted(abort_event)
         self.send_command(0x04) # POWER_ON
         self.ReadBusyH(abort_event)
@@ -224,18 +228,18 @@ class EPD:
             
         return buf
 
-    def display(self, image, abort_event=None):
+    def display(self, image, abort_event=None, fast_refresh=False):
         self._raise_if_aborted(abort_event)
         self.send_command(0x10)
         self.send_data2(image)
 
-        self.TurnOnDisplay(abort_event)
+        self.TurnOnDisplay(abort_event, fast_refresh=fast_refresh)
         
-    def Clear(self, color=0x11):
+    def Clear(self, color=0x11, fast_refresh=False):
         self.send_command(0x10)
         self.send_data2([color] * int(self.height) * int(self.width/2))
 
-        self.TurnOnDisplay()
+        self.TurnOnDisplay(fast_refresh=fast_refresh)
 
     def sleep(self):
         self.send_command(0x07) # DEEP_SLEEP

@@ -3483,8 +3483,9 @@ class FileManager:
 class EInkDisplay:
     """Waveshare ePaper display adapter with lazy initialization."""
 
-    def __init__(self):
+    def __init__(self, settings_path="settings.json"):
         # Don't initialize e-ink hardware at startup — takes 5-10s
+        self.settings_path = settings_path
         self.epd = None
         self._initialized = False
         self._display_busy = False  # True while the panel is mid-refresh
@@ -3534,20 +3535,29 @@ class EInkDisplay:
         with self._display_lock:
             self._last_display_buffer = bytearray(buffer)
 
+    def _fast_refresh_enabled(self):
+        try:
+            with open(self.settings_path, "r") as settings_file:
+                settings = json.load(settings_file)
+            display_settings = settings.get("display", {}) if isinstance(settings, dict) else {}
+            return isinstance(display_settings, dict) and display_settings.get("fast_refresh") is True
+        except (OSError, ValueError):
+            return False
+
     def display_image(self, image):
         """Displays the provided image on the e-ink display."""
         self._ensure_initialized()  # Initialize only when first used
         buffer = ImageProcessor.img2buffer(image)
         if buffer:
             self._remember_display_buffer(buffer)
-            self.epd.display(buffer)
+            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled())
 
     def display_buffer(self, buffer):
         """Send a pre-built display buffer to the e-ink panel (blocking)."""
         self._ensure_initialized()
         if buffer:
             self._remember_display_buffer(buffer)
-            self.epd.display(buffer)
+            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled())
 
     def display_buffer_async(self, buffer):
         """Send a pre-built display buffer to the e-ink panel in a background thread.
@@ -3575,7 +3585,7 @@ class EInkDisplay:
                 self._ensure_initialized()
                 logging.info("Display refresh started (background)")
                 refresh_start = time.monotonic()
-                self.epd.display(buffer, abort_event=abort_event)
+                self.epd.display(buffer, abort_event=abort_event, fast_refresh=self._fast_refresh_enabled())
                 refresh_time = time.monotonic() - refresh_start
                 logging.info(f"Display refresh completed in {refresh_time:.1f}s")
             except Exception as e:
@@ -3730,7 +3740,7 @@ class EInkDisplay:
         """Clear the e-ink display."""
         self._ensure_initialized()  # Initialize only when first used
         try:
-            self.epd.Clear()
+            self.epd.Clear(fast_refresh=self._fast_refresh_enabled())
             logging.info("E-ink display cleared")
             return {"success": True, "message": "Display cleared"}
         except Exception as e:
@@ -3766,7 +3776,7 @@ class CameraSystem:
     """Complete camera system that implements dashboard-like functionality."""
 
     def __init__(self, settings_path="settings.json", eink_display=None):
-        self.eink_display = eink_display if eink_display is not None else EInkDisplay()
+        self.eink_display = eink_display if eink_display is not None else EInkDisplay(settings_path)
         self.camera_manager = CameraManager(settings_path)
         self.file_manager = FileManager(SAVE_PATH, PROCESSED_PATH)
         self.timeout_thread = None
@@ -4801,8 +4811,8 @@ def _start_api_server_in_background(host: str = "127.0.0.1", port: int = 8077):
 def main():
     global camera_system
 
-    startup_display = EInkDisplay()
     startup_settings_path = os.path.join(BASE_PATH, "settings.json")
+    startup_display = EInkDisplay(startup_settings_path)
     if _auto_display_enabled(startup_settings_path):
         startup_display.prepare_async()
 

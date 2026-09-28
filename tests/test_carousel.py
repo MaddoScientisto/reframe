@@ -19,6 +19,16 @@ import reframe
 
 
 class CarouselDashboardTests(unittest.TestCase):
+    def test_fast_refresh_defaults_off_and_requires_boolean(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = dashboard.SettingsManager(str(Path(temp_dir) / "settings.json"))
+            self.assertFalse(manager.load_settings()["display"]["fast_refresh"])
+            self.assertTrue(manager.save_settings({"display": {"fast_refresh": True}}))
+            self.assertTrue(manager.load_settings()["display"]["fast_refresh"])
+
+            with self.assertRaises(dashboard.SettingsValidationError):
+                manager.save_settings({"display": {"fast_refresh": "true"}})
+
     def test_settings_include_carousel_defaults_and_validate_interval(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = dashboard.SettingsManager(str(Path(temp_dir) / "settings.json"))

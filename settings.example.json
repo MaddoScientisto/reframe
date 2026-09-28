@@ -35,6 +35,7 @@
   "display": {
     "auto_display": true,
     "display_timeout": 0,
+    "fast_refresh": false,
     "interrupt_refresh_on_capture": false,
     "refresh_interrupt_action": "reset"
   },

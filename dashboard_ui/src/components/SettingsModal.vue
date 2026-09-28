@@ -56,6 +56,7 @@ function defaultSettings() {
     display: {
       auto_display: true,
       display_timeout: 0,
+      fast_refresh: false,
       interrupt_refresh_on_capture: false,
       refresh_interrupt_action: 'reset',
     },
@@ -288,6 +289,7 @@ function isDownloadBuilding(status) {
           <h3>display controls</h3>
           <label class="setting-row">auto display <select v-model="draft.display.auto_display"><option :value="true">enabled</option><option :value="false">disabled</option></select></label>
           <label class="setting-row">display timeout <input v-model.number="draft.display.display_timeout" type="number" min="0" max="3600" /></label>
+          <label class="setting-row">screen refresh <select v-model="draft.display.fast_refresh"><option :value="false">standard</option><option :value="true">fast (experimental)</option></select></label>
           <label class="setting-row">interrupt refresh on capture <select v-model="draft.display.interrupt_refresh_on_capture"><option :value="false">disabled</option><option :value="true">enabled</option></select></label>
           <label class="setting-row">capture interrupt action <select v-model="draft.display.refresh_interrupt_action"><option value="reset">force reset</option><option value="stop">force stop</option></select></label>
           <div class="button-row wrap-row">

@@ -166,6 +166,7 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     display = section(settings, "display", "display")
     boolean(display.get("auto_display"), "display.auto_display")
     number(display.get("display_timeout"), "display.display_timeout", 0, 3600)
+    boolean(display.get("fast_refresh"), "display.fast_refresh")
     boolean(display.get("interrupt_refresh_on_capture"), "display.interrupt_refresh_on_capture")
     if display.get("refresh_interrupt_action") not in {"reset", "stop"}:
         raise SettingsValidationError("display.refresh_interrupt_action must be reset or stop")
@@ -227,6 +228,7 @@ class SettingsManager:
             "display": {
                 "auto_display": True,
                 "display_timeout": 0,
+                "fast_refresh": False,
                 "interrupt_refresh_on_capture": False,
                 "refresh_interrupt_action": "reset"
             },
