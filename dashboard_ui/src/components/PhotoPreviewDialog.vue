@@ -44,6 +44,8 @@ const error = ref('')
 const rotation = ref(0)
 const imageDimensions = ref(null)
 const ditherControlsOpen = ref(false)
+const refreshMenuOpen = ref(false)
+const refreshMenuRef = ref(null)
 const extensionBusy = ref('')
 const carouselIncluded = ref(false)
 const carouselSaving = ref(false)
@@ -246,6 +248,7 @@ function resetPreviewState(photo) {
   imageDimensions.value = null
   resetViewport()
   ditherControlsOpen.value = false
+  refreshMenuOpen.value = false
   metadataOpen.value = typeof window === 'undefined' || !window.matchMedia('(max-width: 700px)').matches
   extensionBusy.value = ''
   carouselIncluded.value = Boolean(photo.carousel_enabled)
@@ -348,6 +351,9 @@ function closeDialog() {
 }
 
 function handleDocumentPointerDown(event) {
+  if (refreshMenuOpen.value && !refreshMenuRef.value?.contains(event.target)) {
+    refreshMenuOpen.value = false
+  }
   const dialog = dialogRef.value
   if (!dialog?.open || deleteDialogRef.value?.open) return
   const bounds = dialog.getBoundingClientRect()
@@ -358,8 +364,17 @@ function handleDocumentPointerDown(event) {
   if (outside) closeDialog()
 }
 
+function handleDialogKeydown(event) {
+  if (event.key === 'Escape' && refreshMenuOpen.value) {
+    event.preventDefault()
+    event.stopPropagation()
+    refreshMenuOpen.value = false
+  }
+}
+
 function handleClose() {
   cancelPreviewRequest()
+  refreshMenuOpen.value = false
   emit('close')
 }
 
@@ -499,14 +514,18 @@ async function downloadImage(kind, event) {
   }
 }
 
-async function sendToDisplay() {
+async function sendToDisplay(fastRefresh) {
   if (!props.photo || loading.value || sending.value || (isGenerated.value && !generatedPng.value)) return
+  refreshMenuOpen.value = false
   sending.value = true
   error.value = ''
   try {
     const result = isGenerated.value
-      ? await displayPreview({ png: generatedPng.value })
-      : await displayPhoto(props.photo.id)
+      ? await displayPreview({
+          png: generatedPng.value,
+          ...(typeof fastRefresh === 'boolean' ? { fast_refresh: fastRefresh } : {}),
+        })
+      : await displayPhoto(props.photo.id, fastRefresh)
     emit('notify', result.message || 'sent to screen')
   } catch (sendError) {
     error.value = sendError.message || 'Could not display photo'
@@ -628,7 +647,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <dialog ref="dialogRef" class="preview-dialog photo-preview-dialog" aria-labelledby="preview-title" @close="handleClose">
+  <dialog ref="dialogRef" class="preview-dialog photo-preview-dialog" aria-labelledby="preview-title" @close="handleClose" @keydown="handleDialogKeydown">
     <div class="dialog-header">
       <h2 id="preview-title">{{ photo?.filename || photo?.id }}</h2>
       <label class="carousel-toggle">
@@ -763,6 +782,22 @@ onUnmounted(() => {
             <button class="action-button primary" type="button" :disabled="!hasChanges || loading || saving" @click="savePreview">
               {{ saving ? 'saving...' : 'save' }}
             </button>
+            <div ref="refreshMenuRef" class="photo-action-menu refresh-mode-menu">
+              <button
+                class="icon-button photo-menu-button"
+                type="button"
+                aria-label="Refresh options"
+                title="Refresh options"
+                aria-haspopup="menu"
+                :aria-expanded="refreshMenuOpen"
+                :disabled="loading || sending || saving || (isGenerated && !generatedPng)"
+                @click="refreshMenuOpen = !refreshMenuOpen"
+              >...</button>
+              <div v-if="refreshMenuOpen" class="photo-context-menu" role="menu">
+                <button class="photo-context-item" type="button" role="menuitem" @click="sendToDisplay(true)">Refresh - Fast (experimental)</button>
+                <button class="photo-context-item" type="button" role="menuitem" @click="sendToDisplay(false)">Refresh - Slow</button>
+              </div>
+            </div>
             <button
               v-for="action in extensionActions.filter((item) => !item.requires_dithered || photo?.has_dithered)"
               v-show="!isGenerated && photo?.has_dithered"

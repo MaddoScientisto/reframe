@@ -1634,10 +1634,13 @@ async def redraw_display():
         raise HTTPException(status_code=500, detail=f"Failed to redraw display: {str(e)}")
 
 @app.post("/api/display/{photo_id}")
-async def display_photo_on_screen(photo_id: str):
+async def display_photo_on_screen(photo_id: str, fast_refresh: Optional[bool] = None):
     """Display a specific photo on the e-ink screen."""
     try:
-        result = await reframe_client.post(f"/display/{photo_id}")
+        path = f"/display/{photo_id}"
+        if fast_refresh is not None:
+            path += f"?fast_refresh={'true' if fast_refresh else 'false'}"
+        result = await reframe_client.post(path)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

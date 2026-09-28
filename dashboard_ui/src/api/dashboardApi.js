@@ -55,8 +55,9 @@ export function setCarouselPhoto(photoId, included) {
   return jsonRequest(`/api/carousel/photos/${encodeURIComponent(photoId)}`, 'POST', { included })
 }
 
-export function displayPhoto(photoId) {
-  return request(`/api/display/${encodeURIComponent(photoId)}`, { method: 'POST' })
+export function displayPhoto(photoId, fastRefresh) {
+  const query = typeof fastRefresh === 'boolean' ? `?fast_refresh=${fastRefresh}` : ''
+  return request(`/api/display/${encodeURIComponent(photoId)}${query}`, { method: 'POST' })
 }
 
 export function displayPreview(body) {

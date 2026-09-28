@@ -395,6 +395,15 @@ p {
   padding-left: 8px;
 }
 
+.refresh-mode-menu {
+  margin-left: 0;
+}
+
+.refresh-mode-menu .photo-context-menu {
+  min-width: 250px;
+  max-width: calc(100vw - 40px);
+}
+
 .photo-context-menu {
   position: absolute;
   z-index: 5;

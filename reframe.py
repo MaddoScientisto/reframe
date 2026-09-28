@@ -3535,7 +3535,9 @@ class EInkDisplay:
         with self._display_lock:
             self._last_display_buffer = bytearray(buffer)
 
-    def _fast_refresh_enabled(self):
+    def _fast_refresh_enabled(self, override=None):
+        if override is not None:
+            return override is True
         try:
             with open(self.settings_path, "r") as settings_file:
                 settings = json.load(settings_file)
@@ -3544,22 +3546,22 @@ class EInkDisplay:
         except (OSError, ValueError):
             return False
 
-    def display_image(self, image):
+    def display_image(self, image, fast_refresh=None):
         """Displays the provided image on the e-ink display."""
         self._ensure_initialized()  # Initialize only when first used
         buffer = ImageProcessor.img2buffer(image)
         if buffer:
             self._remember_display_buffer(buffer)
-            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled())
+            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled(fast_refresh))
 
-    def display_buffer(self, buffer):
+    def display_buffer(self, buffer, fast_refresh=None):
         """Send a pre-built display buffer to the e-ink panel (blocking)."""
         self._ensure_initialized()
         if buffer:
             self._remember_display_buffer(buffer)
-            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled())
+            self.epd.display(buffer, fast_refresh=self._fast_refresh_enabled(fast_refresh))
 
-    def display_buffer_async(self, buffer):
+    def display_buffer_async(self, buffer, fast_refresh=None):
         """Send a pre-built display buffer to the e-ink panel in a background thread.
 
         Sets _display_busy=True before starting and clears it when the refresh
@@ -3585,7 +3587,11 @@ class EInkDisplay:
                 self._ensure_initialized()
                 logging.info("Display refresh started (background)")
                 refresh_start = time.monotonic()
-                self.epd.display(buffer, abort_event=abort_event, fast_refresh=self._fast_refresh_enabled())
+                self.epd.display(
+                    buffer,
+                    abort_event=abort_event,
+                    fast_refresh=self._fast_refresh_enabled(fast_refresh),
+                )
                 refresh_time = time.monotonic() - refresh_start
                 logging.info(f"Display refresh completed in {refresh_time:.1f}s")
             except Exception as e:
@@ -3679,7 +3685,7 @@ class EInkDisplay:
         return result
 
     def display_photo_by_id(self, photo_id, file_manager, prefer_dithered=True,
-                            processing_settings=None):
+                            processing_settings=None, fast_refresh=None):
         """Display a photo by ID on the e-ink screen."""
         try:
             photo_info = file_manager.get_photo_info(photo_id)
@@ -3716,7 +3722,7 @@ class EInkDisplay:
                     )
                 else:
                     display_image = ImageProcessor.prepare_dithered_for_display(image)
-                self.display_image(display_image)
+                self.display_image(display_image, fast_refresh=fast_refresh)
 
             logging.info(f"Displayed {version} version of photo {photo_id} on e-ink screen")
 
@@ -4217,12 +4223,13 @@ class CameraSystem:
                     except Exception:
                         pass
 
-    def display_photo_api(self, photo_id):
+    def display_photo_api(self, photo_id, fast_refresh=None):
         """API-style photo display."""
         return self.eink_display.display_photo_by_id(
             photo_id,
             self.file_manager,
-            processing_settings=self.camera_manager.settings.get("processing", {})
+            processing_settings=self.camera_manager.settings.get("processing", {}),
+            fast_refresh=fast_refresh,
         )
 
     def reprocess_photo_api(self, photo_id, processing_settings=None):
@@ -4562,14 +4569,14 @@ def _create_fastapi_routes():
             return camera_system.eink_display.redraw_last_display()
 
     @app.post("/api/display/{photo_id}")
-    def api_display(photo_id: str):
+    def api_display(photo_id: str, fast_refresh: Optional[bool] = None):
         global camera_system
         if camera_system is None:
             raise HTTPException(status_code=503, detail="Camera system not initialized")
         try:
             with _operation_lock:
                 camera_system.update_activity()
-                result = camera_system.display_photo_api(photo_id)
+                result = camera_system.display_photo_api(photo_id, fast_refresh=fast_refresh)
             return result
         except Exception as e:
             logging.error(f"Error displaying photo {photo_id}: {e}")
@@ -4648,6 +4655,9 @@ def _create_fastapi_routes():
         encoded = body.get("png")
         if not isinstance(encoded, str) or len(encoded) > 2_000_000:
             raise HTTPException(status_code=400, detail="Invalid preview image")
+        fast_refresh = body.get("fast_refresh")
+        if fast_refresh is not None and not isinstance(fast_refresh, bool):
+            raise HTTPException(status_code=400, detail="fast_refresh must be true or false")
         try:
             Image, _ = _lazy_import_pil()
             with Image.open(BytesIO(base64.b64decode(encoded, validate=True))) as image:
@@ -4658,7 +4668,10 @@ def _create_fastapi_routes():
             raise HTTPException(status_code=400, detail="Invalid preview image") from error
         with _operation_lock:
             camera_system.update_activity()
-            result = camera_system.eink_display.display_buffer_async(buffer)
+            result = camera_system.eink_display.display_buffer_async(
+                buffer,
+                fast_refresh=fast_refresh,
+            )
         if result.get("success"):
             result["message"] = "Preview sent to screen"
         return result

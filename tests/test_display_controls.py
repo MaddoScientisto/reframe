@@ -86,6 +86,20 @@ class DisplayControlTests(unittest.TestCase):
         self.display.display_buffer(b"fourth")
         self.assertFalse(self.display.epd.refresh_modes[-1])
 
+    def test_fast_refresh_override_applies_to_one_refresh_only(self):
+        self.settings_path.write_text(json.dumps({"display": {"fast_refresh": True}}))
+
+        self.display.display_buffer(b"configured")
+        self.display.display_buffer(b"one-shot-slow", fast_refresh=False)
+        self.display.display_buffer(b"one-shot-fast", fast_refresh=True)
+        self.assertEqual(self.display.epd.refresh_modes, [True, False, True])
+
+        self.display.epd.display_started.clear()
+        self.assertTrue(self.display.display_buffer_async(b"async-one-shot", fast_refresh=False)["success"])
+        self.assertTrue(self.display.epd.display_started.wait(1))
+        self.assertFalse(self.display.epd.refresh_modes[-1])
+        self.assertTrue(json.loads(self.settings_path.read_text())["display"]["fast_refresh"])
+
     def test_force_reset_interrupts_refresh_and_redraw_reinitializes(self):
         self.assertTrue(self.display.display_buffer_async(b"first")["success"])
         self.assertTrue(self.display.epd.display_started.wait(1))
