@@ -598,6 +598,7 @@ class CameraManager:
             carousel.setdefault("interval_seconds", 30)
             carousel.setdefault("photo_ids", [])
             carousel.setdefault("shuffle", False)
+            carousel.setdefault("fast_refresh", False)
             metadata = settings.get("metadata")
             if not isinstance(metadata, dict):
                 metadata = {}
@@ -653,7 +654,8 @@ class CameraManager:
                 "carousel": {
                     "interval_seconds": 30,
                     "photo_ids": [],
-                    "shuffle": False
+                    "shuffle": False,
+                    "fast_refresh": False
                 },
                 "system": {
                     "auto_refresh_interval": 30,
@@ -4046,7 +4048,10 @@ class CameraSystem:
                     if stop_event.is_set():
                         return
                     self.update_activity()
-                    result = self.display_photo_api(photo_id)
+                    result = self.display_photo_api(
+                        photo_id,
+                        fast_refresh=self.camera_manager.settings.get("carousel", {}).get("fast_refresh") is True,
+                    )
                 if not result.get("success"):
                     logging.warning("Carousel could not display %s: %s", photo_id, result.get("message"))
 

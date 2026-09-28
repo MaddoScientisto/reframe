@@ -64,6 +64,7 @@ function defaultSettings() {
       interval_seconds: 30,
       photo_ids: [],
       shuffle: false,
+      fast_refresh: false,
     },
     system: {
       auto_refresh_interval: 30,
@@ -271,6 +272,7 @@ function isDownloadBuilding(status) {
           <h3>carousel mode</h3>
           <label class="setting-row">image duration (seconds) <input v-model.number="draft.carousel.interval_seconds" type="number" min="1" max="3600" step="1" /></label>
           <label class="setting-row">shuffle at carousel start <select v-model="draft.carousel.shuffle"><option :value="false">disabled</option><option :value="true">enabled</option></select></label>
+          <label class="setting-row">carousel screen refresh <select v-model="draft.carousel.fast_refresh"><option :value="false">standard</option><option :value="true">fast (experimental)</option></select></label>
           <p class="setting-help">Carousel images are selected from each photo's detail view.</p>
         </section>
 

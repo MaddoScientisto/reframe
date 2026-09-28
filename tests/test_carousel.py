@@ -34,13 +34,24 @@ class CarouselDashboardTests(unittest.TestCase):
             manager = dashboard.SettingsManager(str(Path(temp_dir) / "settings.json"))
             settings = manager.load_settings()
 
-        self.assertEqual(settings["carousel"], {"interval_seconds": 30, "photo_ids": [], "shuffle": False})
+        self.assertEqual(settings["carousel"], {
+            "interval_seconds": 30,
+            "photo_ids": [],
+            "shuffle": False,
+            "fast_refresh": False,
+        })
+        self.assertTrue(manager.save_settings({"carousel": {"fast_refresh": True}}))
+        self.assertTrue(manager.load_settings()["carousel"]["fast_refresh"])
         invalid = copy.deepcopy(settings)
         invalid["carousel"]["interval_seconds"] = 0
         with self.assertRaises(dashboard.SettingsValidationError):
             dashboard.validate_settings(invalid)
         invalid["carousel"]["interval_seconds"] = 30
         invalid["carousel"]["shuffle"] = "yes"
+        with self.assertRaises(dashboard.SettingsValidationError):
+            dashboard.validate_settings(invalid)
+        invalid["carousel"]["shuffle"] = False
+        invalid["carousel"]["fast_refresh"] = "true"
         with self.assertRaises(dashboard.SettingsValidationError):
             dashboard.validate_settings(invalid)
 
@@ -98,7 +109,7 @@ class CarouselWorkerTests(unittest.TestCase):
     def test_start_and_stop_carousel_worker(self):
         displayed = threading.Event()
 
-        def display_photo(photo_id):
+        def display_photo(photo_id, fast_refresh=None):
             displayed.set()
             return {"success": True, "photo_id": photo_id}
 
@@ -128,7 +139,7 @@ class CarouselWorkerTests(unittest.TestCase):
         }
         self.system.file_manager.get_photo_info.side_effect = lambda photo_id: {"id": photo_id}
         displayed = threading.Event()
-        self.system.display_photo_api = lambda photo_id: (displayed.set() or {"success": True})
+        self.system.display_photo_api = lambda photo_id, fast_refresh=None: (displayed.set() or {"success": True})
 
         with patch.object(reframe.CameraSystem, "_shuffle_carousel_queue", return_value=["00003", "00001", "00002"]):
             self.system.start_carousel()

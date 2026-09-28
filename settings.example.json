@@ -42,7 +42,8 @@
   "carousel": {
     "interval_seconds": 30,
     "photo_ids": [],
-    "shuffle": false
+    "shuffle": false,
+    "fast_refresh": false
   },
   "system": {
     "auto_refresh_interval": 30,

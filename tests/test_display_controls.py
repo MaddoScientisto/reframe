@@ -100,6 +100,44 @@ class DisplayControlTests(unittest.TestCase):
         self.assertFalse(self.display.epd.refresh_modes[-1])
         self.assertTrue(json.loads(self.settings_path.read_text())["display"]["fast_refresh"])
 
+    def test_missing_carousel_refresh_setting_defaults_to_standard(self):
+        self.settings_path.write_text(json.dumps({"display": {"fast_refresh": True}}))
+        camera_manager = object.__new__(reframe.CameraManager)
+        camera_manager.settings_path = str(self.settings_path)
+
+        settings = reframe.CameraManager.load_settings(camera_manager)
+
+        self.assertFalse(settings["carousel"]["fast_refresh"])
+
+    def test_carousel_refresh_uses_its_setting_independently(self):
+        for carousel_fast_refresh in (False, True):
+            camera_system = object.__new__(reframe.CameraSystem)
+            camera_system._carousel_lock = threading.Lock()
+            camera_system._carousel_active = True
+            camera_system._carousel_queue = ["photo-id"]
+            camera_system._carousel_current_photo_id = None
+            camera_system._carousel_advance_event = threading.Event()
+            stop_event = threading.Event()
+            camera_system._carousel_stop_event = stop_event
+            camera_system._carousel_thread = None
+            camera_system.camera_manager = types.SimpleNamespace(settings={
+                "display": {"fast_refresh": not carousel_fast_refresh},
+                "carousel": {"fast_refresh": carousel_fast_refresh, "interval_seconds": 30},
+            })
+            camera_system.update_activity = lambda: None
+            display_modes = []
+
+            def display_photo(photo_id, fast_refresh=None):
+                display_modes.append((photo_id, fast_refresh))
+                stop_event.set()
+                camera_system._carousel_advance_event.set()
+                return {"success": True}
+
+            camera_system.display_photo_api = display_photo
+            camera_system._carousel_loop(stop_event)
+
+            self.assertEqual(display_modes, [("photo-id", carousel_fast_refresh)])
+
     def test_force_reset_interrupts_refresh_and_redraw_reinitializes(self):
         self.assertTrue(self.display.display_buffer_async(b"first")["success"])
         self.assertTrue(self.display.epd.display_started.wait(1))

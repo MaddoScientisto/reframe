@@ -241,6 +241,7 @@ def validate_settings(settings: Dict[str, Any]) -> None:
     number(carousel.get("interval_seconds"), "carousel.interval_seconds", 1, 3600)
     text_list(carousel.get("photo_ids"), "carousel.photo_ids", 200)
     boolean(carousel.get("shuffle"), "carousel.shuffle")
+    boolean(carousel.get("fast_refresh"), "carousel.fast_refresh")
 
     system = section(settings, "system", "system")
     integer(system.get("auto_refresh_interval"), "system.auto_refresh_interval", 5, 300)
@@ -301,7 +302,8 @@ class SettingsManager:
             "carousel": {
                 "interval_seconds": 30,
                 "photo_ids": [],
-                "shuffle": False
+                "shuffle": False,
+                "fast_refresh": False
             },
             "system": {
                 "auto_refresh_interval": 30,
