@@ -62,13 +62,17 @@ const whiteBalanceMode = ref(savedWhiteBalanceMode === 'preset' && savedWhiteBal
 const whiteBalancePreset = ref(savedWhiteBalancePreset)
 const redGain = ref(storedNumber(savedPreferences.redGain, 1))
 const blueGain = ref(storedNumber(savedPreferences.blueGain, 1))
+const whiteBalanceWarmth = ref(0)
+const whiteBalanceTint = ref(0)
 const whiteBalanceDragging = ref(false)
 const whiteBalanceBusy = ref(false)
 const whiteBalanceError = ref('')
 const whiteBalanceControlsOpen = ref(false)
+const whiteBalanceMenuOpen = ref('')
 let telemetryTimer = null
 let telemetryPollToken = 0
 let streamReleasePromise = Promise.resolve()
+let whiteBalanceApplyFrame = null
 
 const focusRange = computed(() => telemetry.value?.focus_range || null)
 const focusModeLabel = computed(() => telemetry.value?.focus_mode || focusMode.value)
@@ -107,6 +111,7 @@ watch(
     streamMounted.value = true
     focusControlsOpen.value = false
     whiteBalanceControlsOpen.value = false
+    whiteBalanceMenuOpen.value = ''
     exposureControlsOpen.value = false
     telemetry.value = null
     telemetryError.value = ''
@@ -139,6 +144,11 @@ function stopStream() {
   telemetryPollToken += 1
   clearTimeout(telemetryTimer)
   telemetryTimer = null
+  if (whiteBalanceApplyFrame !== null) {
+    cancelAnimationFrame(whiteBalanceApplyFrame)
+    whiteBalanceApplyFrame = null
+  }
+  whiteBalanceMenuOpen.value = ''
   previewClientId.value = ''
   streamMounted.value = false
   streamKey.value += 1
@@ -187,6 +197,7 @@ async function pollTelemetry(token) {
       if (result.colour_gains) {
         redGain.value = Number(result.colour_gains.red)
         blueGain.value = Number(result.colour_gains.blue)
+        syncWhiteBalanceAxes(redGain.value, blueGain.value)
       }
     }
     if (result.frame_age_seconds === null || result.frame_age_seconds > 2.5) {
@@ -338,6 +349,31 @@ function supportedWhiteBalancePreset() {
     : whiteBalancePresets.value[0]
 }
 
+function toggleWhiteBalanceMenu(menu) {
+  if (cameraControlBusy.value) return
+  whiteBalanceMenuOpen.value = whiteBalanceMenuOpen.value === menu ? '' : menu
+}
+
+function selectWhiteBalanceMode(mode) {
+  whiteBalanceMode.value = mode
+  whiteBalanceMenuOpen.value = ''
+  scheduleWhiteBalanceApply()
+}
+
+function selectWhiteBalancePreset(preset) {
+  whiteBalancePreset.value = preset
+  whiteBalanceMenuOpen.value = ''
+  scheduleWhiteBalanceApply()
+}
+
+function scheduleWhiteBalanceApply() {
+  if (whiteBalanceApplyFrame !== null || whiteBalanceBusy.value) return
+  whiteBalanceApplyFrame = requestAnimationFrame(() => {
+    whiteBalanceApplyFrame = null
+    void applyWhiteBalance()
+  })
+}
+
 async function applyWhiteBalance() {
   if (!previewClientId.value) return
   if (whiteBalanceMode.value === 'preset' && !supportedWhiteBalancePreset()) {
@@ -361,6 +397,7 @@ async function applyWhiteBalance() {
     if (result.colour_gains) {
       redGain.value = Number(result.colour_gains.red)
       blueGain.value = Number(result.colour_gains.blue)
+      syncWhiteBalanceAxes(redGain.value, blueGain.value)
     }
   } catch (error) {
     whiteBalanceError.value = error.message || 'Could not update white balance'
@@ -371,10 +408,73 @@ async function applyWhiteBalance() {
   }
 }
 
-function startWhiteBalanceDrag(channel, event) {
+function clampWhiteBalancePosition(position) {
+  return Math.min(1, Math.max(0, position))
+}
+
+function whiteBalanceRange(name) {
+  return whiteBalanceCapabilities.value?.colour_gains_range?.[name] || null
+}
+
+function gainToWhiteBalancePosition(gain, range) {
+  if (!range || range.max <= range.min) return 0.5
+  return clampWhiteBalancePosition((gain - range.min) / (range.max - range.min))
+}
+
+function positionToWhiteBalanceGain(position, range) {
+  if (!range || range.max <= range.min) return 1
+  const rawGain = range.min + clampWhiteBalancePosition(position) * (range.max - range.min)
+  const steppedGain = range.min + Math.round((rawGain - range.min) / range.step) * range.step
+  return Number(Math.min(range.max, Math.max(range.min, steppedGain)).toFixed(6))
+}
+
+function syncWhiteBalanceAxes(red, blue) {
+  const redRange = whiteBalanceRange('red')
+  const blueRange = whiteBalanceRange('blue')
+  if (!redRange || !blueRange) return
+
+  const redPosition = gainToWhiteBalancePosition(red, redRange)
+  const bluePosition = gainToWhiteBalancePosition(blue, blueRange)
+  const neutralRed = gainToWhiteBalancePosition(1, redRange)
+  const neutralBlue = gainToWhiteBalancePosition(1, blueRange)
+  const warmth = (redPosition - neutralRed) - (bluePosition - neutralBlue)
+  const tint = ((redPosition - neutralRed) + (bluePosition - neutralBlue)) / 2 / 0.25
+
+  whiteBalanceWarmth.value = Math.round(Math.max(-1, Math.min(1, warmth)) * 100)
+  whiteBalanceTint.value = Math.round(Math.max(-1, Math.min(1, tint)) * 100)
+}
+
+function updateWhiteBalanceGains() {
+  const redRange = whiteBalanceRange('red')
+  const blueRange = whiteBalanceRange('blue')
+  if (!redRange || !blueRange) return
+
+  const neutralRed = gainToWhiteBalancePosition(1, redRange)
+  const neutralBlue = gainToWhiteBalancePosition(1, blueRange)
+  const warmth = Number(whiteBalanceWarmth.value) / 100
+  const tint = Number(whiteBalanceTint.value) / 100
+  redGain.value = positionToWhiteBalanceGain(neutralRed + warmth * 0.5 + tint * 0.25, redRange)
+  blueGain.value = positionToWhiteBalanceGain(neutralBlue - warmth * 0.5 + tint * 0.25, blueRange)
+}
+
+function startWhiteBalanceAxisDrag(axis, event) {
   whiteBalanceDragging.value = true
-  if (channel === 'red') redGain.value = Number(event.target.value)
-  if (channel === 'blue') blueGain.value = Number(event.target.value)
+  if (axis === 'warmth') whiteBalanceWarmth.value = Number(event.target.value)
+  if (axis === 'tint') whiteBalanceTint.value = Number(event.target.value)
+  updateWhiteBalanceGains()
+}
+
+function resetWhiteBalanceTuning() {
+  whiteBalanceWarmth.value = 0
+  whiteBalanceTint.value = 0
+  updateWhiteBalanceGains()
+  scheduleWhiteBalanceApply()
+}
+
+function formatWhiteBalanceAxis(value, negativeLabel, positiveLabel) {
+  const roundedValue = Math.round(Number(value))
+  if (Math.abs(roundedValue) < 3) return 'neutral'
+  return `${Math.abs(roundedValue)}% ${roundedValue < 0 ? negativeLabel : positiveLabel}`
 }
 
 function formatShutter(exposureTime) {
@@ -493,51 +593,129 @@ onUnmounted(() => {
           <span>white balance mode</span>
           <span class="preview-controls-summary-state">{{ whiteBalanceMode }}</span>
         </summary>
-        <div v-if="whiteBalanceCapabilities?.supported" class="white-balance-controls preview-control-content">
-          <label>
-            white balance mode
-            <select v-model="whiteBalanceMode" :disabled="cameraControlBusy" @change="applyWhiteBalance">
-              <option value="auto">auto</option>
-              <option v-if="whiteBalanceCapabilities.preset_supported" value="preset">preset</option>
-              <option v-if="whiteBalanceCapabilities.manual_supported" value="manual">custom</option>
-            </select>
-          </label>
-          <label v-if="whiteBalanceMode === 'preset'">
-            preset
-            <select v-model="whiteBalancePreset" :disabled="cameraControlBusy" @change="applyWhiteBalance">
-              <option v-for="preset in whiteBalancePresets" :key="preset" :value="preset">{{ preset }}</option>
-            </select>
-          </label>
+        <div v-if="whiteBalanceCapabilities?.supported" class="white-balance-controls preview-control-content" @click="whiteBalanceMenuOpen = ''">
+          <div class="white-balance-menu-field">
+            <span>white balance mode</span>
+            <div class="white-balance-menu" @click.stop>
+              <button
+                class="white-balance-menu-trigger"
+                type="button"
+                :disabled="cameraControlBusy"
+                :aria-expanded="whiteBalanceMenuOpen === 'mode'"
+                aria-haspopup="listbox"
+                @click="toggleWhiteBalanceMenu('mode')"
+              >
+                <span>{{ whiteBalanceMode === 'manual' ? 'custom' : whiteBalanceMode }}</span>
+                <span aria-hidden="true">v</span>
+              </button>
+              <div v-if="whiteBalanceMenuOpen === 'mode'" class="white-balance-menu-options" role="listbox" aria-label="White balance mode">
+                <button
+                  class="white-balance-menu-option"
+                  type="button"
+                  role="option"
+                  :aria-selected="whiteBalanceMode === 'auto'"
+                  @click="selectWhiteBalanceMode('auto')"
+                >auto</button>
+                <button
+                  v-if="whiteBalanceCapabilities.preset_supported"
+                  class="white-balance-menu-option"
+                  type="button"
+                  role="option"
+                  :aria-selected="whiteBalanceMode === 'preset'"
+                  @click="selectWhiteBalanceMode('preset')"
+                >preset</button>
+                <button
+                  v-if="whiteBalanceCapabilities.manual_supported"
+                  class="white-balance-menu-option"
+                  type="button"
+                  role="option"
+                  :aria-selected="whiteBalanceMode === 'manual'"
+                  @click="selectWhiteBalanceMode('manual')"
+                >custom</button>
+              </div>
+            </div>
+          </div>
+          <div v-if="whiteBalanceMode === 'preset'" class="white-balance-menu-field">
+            <span>preset</span>
+            <div class="white-balance-menu" @click.stop>
+              <button
+                class="white-balance-menu-trigger"
+                type="button"
+                :disabled="cameraControlBusy"
+                :aria-expanded="whiteBalanceMenuOpen === 'preset'"
+                aria-haspopup="listbox"
+                @click="toggleWhiteBalanceMenu('preset')"
+              >
+                <span>{{ whiteBalancePreset }}</span>
+                <span aria-hidden="true">v</span>
+              </button>
+              <div v-if="whiteBalanceMenuOpen === 'preset'" class="white-balance-menu-options" role="listbox" aria-label="White balance preset">
+                <button
+                  v-for="preset in whiteBalancePresets"
+                  :key="preset"
+                  class="white-balance-menu-option"
+                  type="button"
+                  role="option"
+                  :aria-selected="whiteBalancePreset === preset"
+                  @click="selectWhiteBalancePreset(preset)"
+                >{{ preset }}</button>
+              </div>
+            </div>
+          </div>
           <div v-if="whiteBalanceMode === 'manual' && whiteBalanceCapabilities.manual_supported" class="custom-white-balance">
-            <span class="control-section-label">custom white balance</span>
-            <label>
-              red gain
-              <input
-                type="range"
-                :min="whiteBalanceCapabilities.colour_gains_range.red.min"
-                :max="whiteBalanceCapabilities.colour_gains_range.red.max"
-                :step="whiteBalanceCapabilities.colour_gains_range.red.step"
-                :value="redGain"
+            <div class="custom-white-balance-header">
+              <div>
+                <span class="control-section-label">custom white balance</span>
+                <span class="white-balance-help">adjust the colour cast</span>
+              </div>
+              <button
+                class="white-balance-reset"
+                type="button"
                 :disabled="cameraControlBusy"
-                @input="startWhiteBalanceDrag('red', $event)"
-                @change="applyWhiteBalance"
-              />
-              <span class="control-value">{{ formatValue(redGain, 'x') }}</span>
-            </label>
-            <label>
-              blue gain
+                @click="resetWhiteBalanceTuning"
+              >neutral</button>
+            </div>
+            <label class="white-balance-axis">
+              <span class="white-balance-axis-label">
+                <span>cooler</span>
+                <strong>{{ formatWhiteBalanceAxis(whiteBalanceWarmth, 'cool', 'warm') }}</strong>
+                <span>warmer</span>
+              </span>
               <input
+                class="white-balance-axis-slider warmth-slider"
                 type="range"
-                :min="whiteBalanceCapabilities.colour_gains_range.blue.min"
-                :max="whiteBalanceCapabilities.colour_gains_range.blue.max"
-                :step="whiteBalanceCapabilities.colour_gains_range.blue.step"
-                :value="blueGain"
+                min="-100"
+                max="100"
+                step="1"
+                :value="whiteBalanceWarmth"
                 :disabled="cameraControlBusy"
-                @input="startWhiteBalanceDrag('blue', $event)"
-                @change="applyWhiteBalance"
+                @input="startWhiteBalanceAxisDrag('warmth', $event)"
+                @change="scheduleWhiteBalanceApply"
               />
-              <span class="control-value">{{ formatValue(blueGain, 'x') }}</span>
             </label>
+            <label class="white-balance-axis">
+              <span class="white-balance-axis-label">
+                <span>green</span>
+                <strong>{{ formatWhiteBalanceAxis(whiteBalanceTint, 'green', 'magenta') }}</strong>
+                <span>magenta</span>
+              </span>
+              <input
+                class="white-balance-axis-slider tint-slider"
+                type="range"
+                min="-100"
+                max="100"
+                step="1"
+                :value="whiteBalanceTint"
+                :disabled="cameraControlBusy"
+                @input="startWhiteBalanceAxisDrag('tint', $event)"
+                @change="scheduleWhiteBalanceApply"
+              />
+            </label>
+            <div class="white-balance-readout">
+              <span>measured white balance</span>
+              <strong v-if="telemetry?.colour_temperature !== undefined">{{ Math.round(telemetry.colour_temperature) }} K</strong>
+              <strong v-else>settling</strong>
+            </div>
           </div>
         </div>
         <p v-else class="control-unavailable">white-balance capabilities are not available yet</p>

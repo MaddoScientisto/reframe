@@ -21,6 +21,7 @@ import {
   getDeleteProgress,
   getDownloadProgress,
   getExtensionActions,
+  getNetworkStatus,
   getSettings,
   installUpdate,
   resetTimeout,
@@ -40,6 +41,7 @@ const carouselOnly = ref(initialView)
 const extensionActions = ref([])
 const gallery = reactive(usePhotoGallery(carouselOnly))
 const batteryLevel = ref(null)
+const networkStatus = ref({})
 const captureBusy = ref(false)
 const carouselActive = ref(false)
 const carouselBusy = ref(false)
@@ -56,6 +58,7 @@ const notification = ref(null)
 const downloadWasRequested = ref(false)
 let notificationTimer = null
 let batteryTimer = null
+let networkStatusTimer = null
 let refreshTimer = null
 
 const previewAspectRatio = computed(() => {
@@ -459,6 +462,8 @@ onMounted(async () => {
   }
   await updateBattery()
   batteryTimer = setInterval(updateBattery, 30000)
+  await updateNetworkStatus()
+  networkStatusTimer = setInterval(updateNetworkStatus, 30000)
 })
 
 function handlePageHide() {
@@ -476,9 +481,18 @@ async function updateBattery() {
   }
 }
 
+async function updateNetworkStatus() {
+  try {
+    networkStatus.value = await getNetworkStatus()
+  } catch {
+    networkStatus.value = {}
+  }
+}
+
 onUnmounted(() => {
   window.removeEventListener('pagehide', handlePageHide)
   clearInterval(batteryTimer)
+  clearInterval(networkStatusTimer)
   clearInterval(refreshTimer)
   clearTimeout(notificationTimer)
 })
@@ -488,6 +502,7 @@ onUnmounted(() => {
   <main class="app-shell">
     <AppHeader
       :battery-level="batteryLevel"
+      :network-status="networkStatus"
       :photo-count="gallery.pagination.total_photos"
       :capture-busy="captureBusy"
       :carousel-active="carouselActive"
